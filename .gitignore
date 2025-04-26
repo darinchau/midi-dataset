@@ -87,5 +87,6 @@ scripts/playlist_queue.txt
 uploaded_files.txt
 wandb/*
 wandb
-giant midi archive
+giant-midi-archive
+giant-midi-archive.zip
 data

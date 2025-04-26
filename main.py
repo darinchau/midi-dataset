@@ -1,16 +1,23 @@
+import os
 import logging
-from threading import Lock
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm  # Ensure tqdm is imported
-import filecmp  # Import file comparison tool from the standard library
-from collections import defaultdict
+import filecmp
 import hashlib
 import shutil
-import os
 import zipfile
+import json
+import random
+import string
+import tempfile
+import typing
+from collections import defaultdict
+from threading import Lock
+from multiprocessing import Lock as ProcessLock
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from tqdm import tqdm
 from pathlib import Path
 from typing import List
-import json
+from mido import MidiFile
+from functools import partial, reduce, cached_property
 
 # Configure logging
 logging.basicConfig(
@@ -18,10 +25,24 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+ILLEGAL_WINDOWS_NAMES = ("con", "prn", "nul", "aux", "com", "lpt", "lst")
+
 
 class _ExistsAlready(Exception):
     """Custom exception for when a file already exists."""
     pass
+
+
+def _safe_write_json(data, filename):
+    temp_fd, temp_path = tempfile.mkstemp()
+
+    try:
+        with os.fdopen(temp_fd, 'w') as temp_file:
+            json.dump(data, temp_file, indent=4)
+        shutil.move(temp_path, filename)
+    except Exception as e:
+        print(f"Failed to write data: {e}")
+        os.unlink(temp_path)
 
 
 def extract_zip(file_path: str, root: str) -> str:
@@ -106,7 +127,7 @@ def process_directory(base_path: str, unrar_path: str, exts: tuple[str, ...]) ->
     return find_midi_files(base_path, exts=exts)
 
 
-def deduplicate_files(file_paths: List[str]) -> dict:
+def deduplicate_files(file_paths: list[str], name_str_len: int = 8) -> dict:
     """Remove duplicate files based on file content, adding a progress bar for hashing, and return a mapping of original to new file paths."""
     def compute_hash(file_path):
         try:
@@ -115,6 +136,10 @@ def deduplicate_files(file_paths: List[str]) -> dict:
         except Exception as e:
             logging.error(f"Error reading file {file_path}: {e}")
             return None, file_path
+
+    def randomword(length):
+        letters = string.ascii_lowercase
+        return ''.join(random.choice(letters) for i in range(length))
 
     hashes = defaultdict(list)
     with ThreadPoolExecutor() as executor:
@@ -129,13 +154,13 @@ def deduplicate_files(file_paths: List[str]) -> dict:
 
     logging.info(f"Found {len(hashes)} unique file hashes.")
 
-    unique_files: dict[str, int] = {}
-    index = 0
+    unique_files: dict[str, str] = {}
+    file_indices: set[str] = set()
     lock = Lock()
 
     def process_collision(hash_val, paths):
-        nonlocal index
-        local_unique_files: dict[str, int] = {}
+        nonlocal file_indices
+        local_unique_files: dict[str, str] = {}
         unique_paths = []
         for i in range(len(paths)):
             for j in range(i):
@@ -145,8 +170,11 @@ def deduplicate_files(file_paths: List[str]) -> dict:
                 unique_paths.append(paths[i])
         for path in unique_paths:
             with lock:
+                index = randomword(8)
+                while index in file_indices or any(index.startswith(x) for x in ILLEGAL_WINDOWS_NAMES):
+                    index = randomword(8)
+                file_indices.add(index)
                 local_unique_files[path] = index
-                index += 1
 
         return local_unique_files
 
@@ -166,62 +194,142 @@ def deduplicate_files(file_paths: List[str]) -> dict:
     return unique_files
 
 
-def copy_and_rename_files(unique_files: dict[str, int], target_dir: str) -> dict:
+def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_dir_hierachies: tuple[int, ...]) -> dict:
     """Copy files to a new directory with new names and return a mapping of new names to original paths."""
     os.makedirs(target_dir, exist_ok=True)
     mapping = {}
     for original_path, index in tqdm(unique_files.items(), desc="Copying files", unit="file"):
-        new_name = f"{index:8d}.mid"
-        new_path = os.path.join(target_dir, new_name)
+        new_name = f"{index}.mid"
+        parent_dirs = [index[:i] for i in name_dir_hierachies]
+        new_path = os.path.join(target_dir, *parent_dirs, new_name)
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
         shutil.copyfile(original_path, new_path)
-        mapping[new_name] = original_path
+        mapping[index] = original_path
     return mapping
-
-
-def save_mapping_to_json(mapping: dict, json_path: str) -> None:
-    """Save the mapping dictionary to a JSON file."""
-    with open(json_path, 'w') as f:
-        json.dump(mapping, f, indent=4)
 
 
 def pipeline(
     base_directory="./data",
-    target_directory="./giant midi archive",
+    target_directory="./giant-midi-archive",
     unrar_path="C:/Program Files/WinRAR/UnRAR.exe",  # Adjust this path as needed
-    exts=('.mid', '.midi')
+    exts=('.mid', '.midi'),
+    name_str_len: int = 8,
+    name_dir_hierachies: tuple[int, ...] = (1, 2, 3)
 ):
     json_file_path = os.path.join(target_directory, "mapping.json")
 
-    # Process directory and find MIDI files
     midi_files = process_directory(base_directory, unrar_path, exts)
     logging.info(f"Found MIDI files: {len(midi_files)}")
 
-    # Deduplicate files
-    unique_files = deduplicate_files(midi_files)
+    unique_files = deduplicate_files(midi_files, name_str_len=name_str_len)
     logging.info(f"Unique MIDI files after deduplication: {len(unique_files)}")
 
-    # Copy and rename files
-    mapping = copy_and_rename_files(unique_files, target_directory)
+    mapping = copy_and_rename_files(unique_files, target_directory, name_dir_hierachies)
     logging.info(f"Files copied and renamed. Total: {len(mapping)}")
 
-    # Save mapping to JSON file
-    save_mapping_to_json(mapping, json_file_path)
+    _safe_write_json(mapping, json_file_path)
     logging.info(f"Mapping saved to JSON file at {json_file_path}")
 
 
+T = typing.TypeVar("T")
+
+
+class GiantMidiDataset:
+    def __init__(self, root: str):
+        self._path = root
+
+    @property
+    def root(self) -> str:
+        return self._path
+
+    @staticmethod
+    def make_from_directory(
+        root: str,
+        target_directory: str = "./giant-midi-archive",
+        exts: tuple[str, ...] = ('.mid', '.midi', '.kar', '.rmi'),
+        unrar_path: str = "C:/Program Files/WinRAR/UnRAR.exe",
+        name_str_len: int = 8,
+        name_dir_hierachies: tuple[int, ...] = (1, 2, 3),
+    ) -> "GiantMidiDataset":
+        """Create a dataset from a directory."""
+        if not os.path.exists(root):
+            raise FileNotFoundError(f"Directory {root} does not exist.")
+        if not os.path.isdir(root):
+            raise NotADirectoryError(f"{root} is not a directory.")
+
+        pipeline(
+            base_directory=root,
+            target_directory=target_directory,
+            unrar_path=unrar_path,
+            exts=exts,
+            name_str_len=name_str_len,
+            name_dir_hierachies=name_dir_hierachies
+        )
+        return GiantMidiDataset(target_directory)
+
+    def accumulate(
+        self,
+        func: typing.Callable[[str], T],
+        init: typing.Callable[[], T],
+        reduce_func: typing.Callable[[T, T], T],
+        multi_process: bool = True,
+    ) -> T:
+        """Accumulate values from the dataset."""
+        result = init() if callable(init) else init
+        files = list(Path(self.root).rglob("*.mid"))
+        if multi_process:
+            lock = Lock()
+
+            def process_file(file: Path, shared_result: list[T]) -> None:
+                nonlocal func, lock
+                partial_result = func(str(file))
+                with lock:
+                    shared_result.append(partial_result)
+
+            shared_result = []
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                list(tqdm(executor.map(lambda file: process_file(file, shared_result), files), desc="Accumulating files", unit="file", total=len(files)))
+
+            # Split the shared_result list into chunks for reduction
+            chunk_size = len(shared_result) // 16
+            # Reduce the results in parallel
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                futures = [executor.submit(reduce_func, *chunk) for chunk in zip(*[iter(shared_result)] * chunk_size)]
+                for future in tqdm(futures, desc="Reducing results", unit="chunk"):
+                    result = reduce_func(result, future.result())
+
+            return result
+        else:
+            for file in tqdm(files, desc="Accumulating files", unit="file", total=len(files)):
+                result = reduce_func(result, func(str(file)))
+        return result
+
+    @cached_property
+    def num_files(self) -> int:
+        """Return the number of MIDI files in the dataset."""
+        return len(list(Path(self.root).rglob("*.mid")))
+
+    def __len__(self) -> int:
+        """Return the number of MIDI files in the dataset."""
+        return self.num_files
+
+    def get_path(self, index: str) -> str:
+        # Look through the giant-midi-archive directory for the file with the given index like a trie
+        # and return the path to that file.
+        path = [self.root]
+        while True:
+            p = os.path.join(*path)
+            for pt in os.listdir(p):
+                if index.startswith(pt) and os.path.isdir(os.path.join(*path, pt)):
+                    path.append(pt)
+                    break
+                elif pt.startswith(index) and os.path.isfile(os.path.join(*path, pt)):
+                    return os.path.join(*path, pt)
+            else:
+                break
+        raise FileNotFoundError(f"File with index {index} not found in {self.root}.")
+
+
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        base_directory = sys.argv[1]
-    else:
-        base_directory = "./data"
-    if len(sys.argv) > 2:
-        target_directory = sys.argv[2]
-    else:
-        target_directory = "./giant midi archive"
-    if len(sys.argv) > 3:
-        unrar_path = sys.argv[3]
-    else:
-        unrar_path = "C:/Program Files/WinRAR/UnRAR.exe"
-    pipeline(base_directory, target_directory, unrar_path)
+
     logging.info("Pipeline completed successfully.")
