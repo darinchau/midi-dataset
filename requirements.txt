@@ -1,3 +1,4 @@
 rarfile
 tqdm
 mido
+python-vlc
