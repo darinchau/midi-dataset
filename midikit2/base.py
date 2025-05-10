@@ -1,4 +1,5 @@
 from __future__ import annotations
+import line_profiler
 import enum
 import typing
 import io
@@ -162,6 +163,7 @@ def _fix_eot(messages: list[MtrkEvent]):
     return msgs
 
 
+@line_profiler.profile
 def merge_chunks(chunks: typing.Iterable[Chunk]) -> list[MtrkEvent]:
     """Merges all tracks in the chunks into a single track"""
     msgs: list[tuple[MtrkEvent, int]] = []  # (event, abstime)
@@ -184,6 +186,7 @@ def merge_chunks(chunks: typing.Iterable[Chunk]) -> list[MtrkEvent]:
     # return events
 
 
+@line_profiler.profile
 def calculate_note_deltas(chunks: typing.Iterable[Chunk], ticks_per_beat: int) -> list[float]:
     """Calculates the music duration of the events in ticks"""
     from .events import MetaEvent, MidiEvent, MidiMessage

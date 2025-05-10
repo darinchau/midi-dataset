@@ -1,5 +1,6 @@
 # Implements the MIDI message
 from __future__ import annotations
+import line_profiler
 import struct
 import typing
 import enum
@@ -229,6 +230,7 @@ def read_track(infile: typing.BinaryIO) -> TrackChunk:
     return TrackChunk(size, data)
 
 
+@line_profiler.profile
 def read_message(infile: io.BytesIO, status_byte: int, peek_data: list[int], delta: VariableLengthInt):
     msgtype = lookup_message_type(status_byte)
     if msgtype.is_unknown:
@@ -262,6 +264,7 @@ def read_message(infile: io.BytesIO, status_byte: int, peek_data: list[int], del
     )
 
 
+@line_profiler.profile
 def decode_events(data: bytes) -> list[MtrkEvent]:
     size = len(data)
     infile = io.BytesIO(data)

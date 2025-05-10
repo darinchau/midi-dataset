@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from .exceptions import MidiDecodeError, MidiEOFError
 from .base import MidiData
+from functools import lru_cache
+import line_profiler
 
 
 class MessageType(enum.IntEnum):
@@ -46,6 +48,7 @@ class MessageSpec:
         return self.size == -2
 
     @property
+    @line_profiler.profile
     def message_type(self) -> MessageType:
         """Returns the message type"""
         status_byte = self.status_byte & 0xF0 if 0x80 <= self.status_byte < 0xF0 else self.status_byte
@@ -54,35 +57,14 @@ class MessageSpec:
         return MessageType.UNKNOWN
 
 
+@line_profiler.profile
 def lookup_message_type(status_byte: int) -> MessageSpec:
     """Looks up the message type for a given status byte."""
     assert 0 <= status_byte <= 0xFF, f"Status byte {status_byte} is out of range."
-
-    # Use a dictionary to map status bytes to MessageSpec
-    message_spec_map = {
-        0x80: (MessageSpec(status_byte, 3), MessageType.NOTE_OFF),
-        0x90: (MessageSpec(status_byte, 3), MessageType.NOTE_ON),
-        0xA0: (MessageSpec(status_byte, 3), MessageType.POLY_PRESSURE),
-        0xB0: (MessageSpec(status_byte, 3), MessageType.CONTROL_CHANGE),
-        0xC0: (MessageSpec(status_byte, 2), MessageType.PROGRAM_CHANGE),
-        0xD0: (MessageSpec(status_byte, 2), MessageType.CHANNEL_PRESSURE),
-        0xE0: (MessageSpec(status_byte, 3), MessageType.PITCH_BEND),
-        0xF0: (MessageSpec(status_byte, -1), MessageType.SYSTEM_EXCLUSIVE),
-        0xF1: (MessageSpec(status_byte, 2), MessageType.TIME_CODE_QUARTER_FRAME),
-        0xF2: (MessageSpec(status_byte, 3), MessageType.SONG_POSITION_POINTER),
-        0xF3: (MessageSpec(status_byte, 2), MessageType.SONG_SELECT),
-        0xF6: (MessageSpec(status_byte, 1), MessageType.TUNE_REQUEST),
-        0xF8: (MessageSpec(status_byte, 1), MessageType.CLOCK),
-        0xFA: (MessageSpec(status_byte, 1), MessageType.START),
-        0xFB: (MessageSpec(status_byte, 1), MessageType.CONTINUE),
-        0xFC: (MessageSpec(status_byte, 1), MessageType.STOP),
-        0xFE: (MessageSpec(status_byte, 1), MessageType.ACTIVE_SENSING),
-    }
-
-    for key, (spec, t) in message_spec_map.items():
-        if spec.message_type == t:
-            return spec
-    return MessageSpec(status_byte, -2)  # Unknown message type
+    spec, _ = _STATUS_BYTE_MAP.get(status_byte, (None, None))
+    if spec is None:
+        return MessageSpec(status_byte, -2)
+    return spec
 
 
 @dataclass(frozen=True)
@@ -100,6 +82,7 @@ class MidiMessage(MidiData):
     msg_type: MessageSpec
 
     @staticmethod
+    @line_profiler.profile
     def from_bytes(bs: list[int]) -> MidiMessage:
         """Creates a MidiMessage from a list of bytes"""
         if len(bs) == 0:
@@ -107,43 +90,44 @@ class MidiMessage(MidiData):
 
         status_byte = bs[0]
         msg_type = lookup_message_type(status_byte)
+        msgtp = msg_type.message_type
         if msg_type.size != -1 and len(bs) != msg_type.size:
-            raise ValueError(f"Byte list length {len(bs)} (from {msg_type.message_type.name}) does not match expected length {msg_type.size}: {bs}")
+            raise ValueError(f"Byte list length {len(bs)} (from {msgtp.name}) does not match expected length {msg_type.size}: {bs}")
 
-        if msg_type.message_type == MessageType.NOTE_ON:
+        if msgtp == MessageType.NOTE_ON:
             return NoteOnMessage(
                 msg_type=msg_type,
                 note=bs[1],
                 velocity=bs[2],
             )
-        if msg_type.message_type == MessageType.NOTE_OFF:
+        if msgtp == MessageType.NOTE_OFF:
             return NoteOffMessage(
                 msg_type=msg_type,
                 note=bs[1],
                 velocity=bs[2],
             )
-        if msg_type.message_type == MessageType.CONTROL_CHANGE:
+        if msgtp == MessageType.CONTROL_CHANGE:
             return ControlChangeMessage(
                 msg_type=msg_type,
                 controller=bs[1],
                 value=bs[2],
             )
-        if msg_type.message_type == MessageType.PROGRAM_CHANGE:
+        if msgtp == MessageType.PROGRAM_CHANGE:
             return ProgramChangeMessage(
                 msg_type=msg_type,
                 program=bs[1],
             )
-        if msg_type.message_type == MessageType.PITCH_BEND:
+        if msgtp == MessageType.PITCH_BEND:
             return PitchBendMessage(
                 msg_type=msg_type,
                 value=bs[1] | (bs[2] << 7),
             )
-        if msg_type.message_type == MessageType.CHANNEL_PRESSURE:
+        if msgtp == MessageType.CHANNEL_PRESSURE:
             return ChannelPressureMessage(
                 msg_type=msg_type,
                 pressure=bs[1],
             )
-        if msg_type.message_type == MessageType.POLY_PRESSURE:
+        if msgtp == MessageType.POLY_PRESSURE:
             return PolyPressureMessage(
                 msg_type=msg_type,
                 note=bs[1],
