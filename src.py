@@ -344,7 +344,7 @@ class GiantMidiDataset:
                     path.append(pt)
                     break
                 elif pt.startswith(index) and os.path.isfile(os.path.join(*path, pt)):
-                    return os.path.join(*path, pt)
+                    return os.path.abspath(os.path.join(*path, pt))
             else:
                 break
         raise FileNotFoundError(f"File with index {index} not found in {self.root}.")

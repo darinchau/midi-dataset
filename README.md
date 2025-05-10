@@ -1,1 +1,2 @@
 A little utility module I wrote that helps me load a giant midi repository I have
+Midikit2 code copied from https://github.com/darinchau/midikit2, an as-of-now private incomplete library that I plan to support midi 2 and with better type checking than mido

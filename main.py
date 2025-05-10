@@ -1,5 +1,6 @@
 import os
-import mido
+from midikit2 import Midifile
+from midikit2.base import calculate_note_deltas
 import json
 import typing
 from src import GiantMidiDataset
@@ -7,6 +8,16 @@ import vlc
 import time
 
 T = typing.TypeVar("T")
+
+
+def delta_time(path: str) -> float:
+    """Return the largest delta time in the midi file in seconds"""
+    try:
+        midifile = Midifile(path)
+        dts = calculate_note_deltas(midifile.chunks, midifile._header.division)
+        return max(dts)
+    except Exception as e:
+        return -1
 
 
 def analyse(f: typing.Callable[[str], T], name: str | None = None, num_threads: int = 16) -> None:
