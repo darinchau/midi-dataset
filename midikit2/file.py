@@ -8,7 +8,6 @@ from .exceptions import MidiDecodeError, MidiEOFError
 from .events import MtrkEvent, MidiEvent, MetaEvent, SysexEvent, read_header_chunk, read_track, TrackChunk, HeaderChunk, Chunk
 from dataclasses import dataclass, field
 from functools import cached_property
-import line_profiler
 
 
 class Midifile:
@@ -37,7 +36,6 @@ class Midifile:
         if self._path.suffix != ".mid" and self._path.suffix != ".midi":
             raise MidiDecodeError(f"File {self._path} is not a midi file: found {self._path.suffix}")
 
-    @line_profiler.profile
     def _read(self):
         """Read the header and file chunks"""
         with self as f:

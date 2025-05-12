@@ -1,5 +1,4 @@
 from __future__ import annotations
-import line_profiler
 import enum
 import typing
 import io
@@ -7,6 +6,7 @@ import struct
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
+from functools import lru_cache
 from .exceptions import MidiDecodeError, MidiEOFError
 
 
@@ -57,6 +57,7 @@ class VariableLengthInt:
         raise MidiDecodeError('Variable length integer too long')
 
     @staticmethod
+    @lru_cache(maxsize=1000)
     def from_int(value: int):
         """Creates a VariableLengthInt from an integer"""
         # if not (0 <= value < (1 << 64)):
@@ -163,7 +164,6 @@ def _fix_eot(messages: list[MtrkEvent]):
     return msgs
 
 
-@line_profiler.profile
 def merge_chunks(chunks: typing.Iterable[Chunk]) -> list[MtrkEvent]:
     """Merges all tracks in the chunks into a single track"""
     msgs: list[tuple[MtrkEvent, int]] = []  # (event, abstime)
@@ -186,7 +186,6 @@ def merge_chunks(chunks: typing.Iterable[Chunk]) -> list[MtrkEvent]:
     # return events
 
 
-@line_profiler.profile
 def calculate_note_deltas(chunks: typing.Iterable[Chunk], ticks_per_beat: int) -> list[float]:
     """Calculates the music duration of the events in ticks"""
     from .events import MetaEvent, MidiEvent, MidiMessage

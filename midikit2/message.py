@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from .exceptions import MidiDecodeError, MidiEOFError
 from .base import MidiData
 from functools import lru_cache
-import line_profiler
 
 
 class MessageType(enum.IntEnum):
@@ -48,23 +47,40 @@ class MessageSpec:
         return self.size == -2
 
     @property
-    @line_profiler.profile
     def message_type(self) -> MessageType:
         """Returns the message type"""
-        status_byte = self.status_byte & 0xF0 if 0x80 <= self.status_byte < 0xF0 else self.status_byte
-        if status_byte in [t.value for t in MessageType]:
-            return MessageType(status_byte)
-        return MessageType.UNKNOWN
+        return lookup_message_type(self.status_byte)[1]
 
 
-@line_profiler.profile
-def lookup_message_type(status_byte: int) -> MessageSpec:
+_MESSAGE_SPEC_MAP = {
+    0x80: (3, MessageType.NOTE_OFF),
+    0x90: (3, MessageType.NOTE_ON),
+    0xA0: (3, MessageType.POLY_PRESSURE),
+    0xB0: (3, MessageType.CONTROL_CHANGE),
+    0xC0: (2, MessageType.PROGRAM_CHANGE),
+    0xD0: (2, MessageType.CHANNEL_PRESSURE),
+    0xE0: (3, MessageType.PITCH_BEND),
+    0xF0: (-1, MessageType.SYSTEM_EXCLUSIVE),
+    0xF1: (2, MessageType.TIME_CODE_QUARTER_FRAME),
+    0xF2: (3, MessageType.SONG_POSITION_POINTER),
+    0xF3: (2, MessageType.SONG_SELECT),
+    0xF6: (1, MessageType.TUNE_REQUEST),
+    0xF8: (1, MessageType.CLOCK),
+    0xFA: (1, MessageType.START),
+    0xFB: (1, MessageType.CONTINUE),
+    0xFC: (1, MessageType.STOP),
+    0xFE: (1, MessageType.ACTIVE_SENSING),
+}
+
+
+@lru_cache(maxsize=256)
+def lookup_message_type(status_byte: int) -> tuple[MessageSpec, MessageType]:
     """Looks up the message type for a given status byte."""
     assert 0 <= status_byte <= 0xFF, f"Status byte {status_byte} is out of range."
-    spec, _ = _STATUS_BYTE_MAP.get(status_byte, (None, None))
-    if spec is None:
-        return MessageSpec(status_byte, -2)
-    return spec
+
+    sb = status_byte & 0xF0 if 0x80 <= status_byte < 0xF0 else status_byte
+    nbytes, msgtype = _MESSAGE_SPEC_MAP.get(sb, (-2, MessageType.UNKNOWN))
+    return MessageSpec(status_byte, nbytes), msgtype
 
 
 @dataclass(frozen=True)
@@ -76,67 +92,73 @@ class ModeNumber:
             raise MidiDecodeError(f"Mode number {self.value} is out of range.")
 
 
+@lru_cache(maxsize=None)
+def _midi_message_from_bytes(bs: tuple[int, ...]) -> MidiMessage:
+    """Creates a MidiMessage from a tuple of bytes"""
+    if len(bs) == 0:
+        raise ValueError("Empty byte list")
+
+    status_byte = bs[0]
+    msg_type, msgtp = lookup_message_type(status_byte)
+    if msg_type.size != -1 and len(bs) != msg_type.size:
+        raise ValueError(f"Byte list length {len(bs)} (from {msgtp.name}) does not match expected length {msg_type.size}: {bs}")
+
+    if msgtp == MessageType.NOTE_ON:
+        return NoteOnMessage(
+            msg_type=msg_type,
+            note=bs[1],
+            velocity=bs[2],
+        )
+    if msgtp == MessageType.NOTE_OFF:
+        return NoteOffMessage(
+            msg_type=msg_type,
+            note=bs[1],
+            velocity=bs[2],
+        )
+    if msgtp == MessageType.CONTROL_CHANGE:
+        return ControlChangeMessage(
+            msg_type=msg_type,
+            controller=bs[1],
+            value=bs[2],
+        )
+    if msgtp == MessageType.PROGRAM_CHANGE:
+        return ProgramChangeMessage(
+            msg_type=msg_type,
+            program=bs[1],
+        )
+    if msgtp == MessageType.PITCH_BEND:
+        return PitchBendMessage(
+            msg_type=msg_type,
+            value=bs[1] | (bs[2] << 7),
+        )
+    if msgtp == MessageType.CHANNEL_PRESSURE:
+        return ChannelPressureMessage(
+            msg_type=msg_type,
+            pressure=bs[1],
+        )
+    if msgtp == MessageType.POLY_PRESSURE:
+        return PolyPressureMessage(
+            msg_type=msg_type,
+            note=bs[1],
+            pressure=bs[2],
+        )
+    return UnknownMessage(
+        msg_type=msg_type,
+        data=bytes(bs[1:]),
+    )
+
+
 @dataclass(frozen=True)
 class MidiMessage(MidiData):
     """Base class for MIDI messages"""
     msg_type: MessageSpec
 
     @staticmethod
-    @line_profiler.profile
     def from_bytes(bs: list[int]) -> MidiMessage:
         """Creates a MidiMessage from a list of bytes"""
         if len(bs) == 0:
             raise ValueError("Empty byte list")
-
-        status_byte = bs[0]
-        msg_type = lookup_message_type(status_byte)
-        msgtp = msg_type.message_type
-        if msg_type.size != -1 and len(bs) != msg_type.size:
-            raise ValueError(f"Byte list length {len(bs)} (from {msgtp.name}) does not match expected length {msg_type.size}: {bs}")
-
-        if msgtp == MessageType.NOTE_ON:
-            return NoteOnMessage(
-                msg_type=msg_type,
-                note=bs[1],
-                velocity=bs[2],
-            )
-        if msgtp == MessageType.NOTE_OFF:
-            return NoteOffMessage(
-                msg_type=msg_type,
-                note=bs[1],
-                velocity=bs[2],
-            )
-        if msgtp == MessageType.CONTROL_CHANGE:
-            return ControlChangeMessage(
-                msg_type=msg_type,
-                controller=bs[1],
-                value=bs[2],
-            )
-        if msgtp == MessageType.PROGRAM_CHANGE:
-            return ProgramChangeMessage(
-                msg_type=msg_type,
-                program=bs[1],
-            )
-        if msgtp == MessageType.PITCH_BEND:
-            return PitchBendMessage(
-                msg_type=msg_type,
-                value=bs[1] | (bs[2] << 7),
-            )
-        if msgtp == MessageType.CHANNEL_PRESSURE:
-            return ChannelPressureMessage(
-                msg_type=msg_type,
-                pressure=bs[1],
-            )
-        if msgtp == MessageType.POLY_PRESSURE:
-            return PolyPressureMessage(
-                msg_type=msg_type,
-                note=bs[1],
-                pressure=bs[2],
-            )
-        return UnknownMessage(
-            msg_type=msg_type,
-            data=bytes(bs[1:]),
-        )
+        return _midi_message_from_bytes((*bs,))
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,3 @@
-import line_profiler
 import os
 from midikit2 import Midifile
 from midikit2.base import calculate_note_deltas
@@ -10,7 +9,6 @@ import time
 T = typing.TypeVar("T")
 
 
-@line_profiler.profile
 def delta_time(path: str) -> float:
     """Return the largest delta time in the midi file in seconds"""
     try:
