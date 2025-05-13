@@ -281,10 +281,12 @@ class GiantMidiDataset:
         paths = [p for p in paths if p.stem[:8] not in self._known_outliers]
         return paths
 
-    def add_outlier(self, outlier: str) -> None:
-        assert len(outlier) == 8, "Outlier must be 8 characters long."
-        self._known_outliers.add(outlier)
-        _safe_write_json(sorted(self._known_outliers), self._outliers_path)
+    def add_outlier(self, outlier: str | None = None, write: bool = True) -> None:
+        if outlier is not None:
+            assert len(outlier) == 8, "Outlier must be 8 characters long."
+            self._known_outliers.add(outlier)
+        if write:
+            _safe_write_json(sorted(self._known_outliers), self._outliers_path)
 
     def accumulate(
         self,
@@ -349,7 +351,7 @@ class GiantMidiDataset:
                 break
         raise FileNotFoundError(f"File with index {index} not found in {self.root}.")
 
-    def lookup_info(self, key: str, index: str | None = None):
+    def lookup_info(self, key: str, index: str | None = None) -> dict[str, typing.Any]:
         path = os.path.join(self.root, f"{key}.json")
         if not os.path.exists(path):
             raise FileNotFoundError(f"The key {key} doesn't exist")
