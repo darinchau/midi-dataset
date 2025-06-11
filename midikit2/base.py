@@ -187,7 +187,7 @@ def merge_chunks(chunks: typing.Iterable[Chunk]) -> list[MtrkEvent]:
 
 
 def calculate_note_deltas(chunks: typing.Iterable[Chunk], ticks_per_beat: int) -> list[float]:
-    """Calculates the music duration of the events in ticks"""
+    """Calculates the music duration of the events in seconds"""
     from .events import MetaEvent, MidiEvent, MidiMessage
     from .message import NoteOnMessage, NoteOffMessage
     from .meta import MetaEventType, MetaEventSetTempo

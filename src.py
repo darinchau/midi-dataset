@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import logging
 import filecmp
@@ -237,18 +238,13 @@ T = typing.TypeVar("T")
 class GiantMidiDataset:
     def __init__(self, root: str):
         self._path = root
-        self._known_outliers: set[str] = set()
-        if os.path.exists(self._outliers_path):
-            with open(self._outliers_path, "r") as f:
-                self._known_outliers = set(json.load(f))
+        self._filters: list[typing.Callable[[GiantMidiDataset, str], bool]] = []
+        self._outliers: set[str] = set()
+        self._infos: dict[str, dict[str, typing.Any]] = {}
 
     @property
     def root(self) -> str:
         return self._path
-
-    @property
-    def _outliers_path(self) -> str:
-        return os.path.join(self.root, "outliers.json")
 
     @staticmethod
     def make_from_directory(
@@ -276,17 +272,9 @@ class GiantMidiDataset:
         return GiantMidiDataset(target_directory)
 
     def get_all_paths(self) -> list[Path]:
-        """Return all paths to MIDI files in the dataset."""
+        """Return all paths to MIDI files in the dataset. This list is not filtered."""
         paths = list(Path(self.root).rglob("*.mid")) + list(Path(self.root).rglob("*.midi"))
-        paths = [p for p in paths if p.stem[:8] not in self._known_outliers]
         return paths
-
-    def add_outlier(self, outlier: str | None = None, write: bool = True) -> None:
-        if outlier is not None:
-            assert len(outlier) == 8, "Outlier must be 8 characters long."
-            self._known_outliers.add(outlier)
-        if write:
-            _safe_write_json(sorted(self._known_outliers), self._outliers_path)
 
     def accumulate(
         self,
@@ -334,12 +322,33 @@ class GiantMidiDataset:
         """Return the number of MIDI files in the dataset."""
         return self.num_files
 
+    def add_filter(self, func: typing.Callable[[GiantMidiDataset, str], bool]) -> None:
+        """Add a filter function to the dataset. The function should accept the dataset and the path return True for files that should be included."""
+        self._filters.append(func)
+
+    def is_outlier(self, index: str) -> bool:
+        """Check if a file is an outlier based on the filters."""
+        if index in self._outliers:
+            return True
+        for f in self._filters:
+            if not f(self, index):
+                self._outliers.add(index)
+                return True
+        return False
+
+    def get_paths(self):
+        """Get all paths to MIDI files in the dataset, excluding outliers."""
+        for path in self.get_all_paths():
+            index = path.stem
+            if not self.is_outlier(index):
+                yield path
+
     def get_path(self, index: str) -> str:
+        """Get the absolute path to a MIDI file in the dataset by its index. This does not filter the dataset."""
         # Look through the giant-midi-archive directory for the file with the given index like a trie
         # and return the path to that file.
         path = [self.root]
-        index_not_outlier = index not in self._known_outliers
-        while index_not_outlier:  # Functions like while True if index is not an outlier, and shortcuts to the end if it is
+        while True:
             p = os.path.join(*path)
             for pt in os.listdir(p):
                 if index.startswith(pt) and os.path.isdir(os.path.join(*path, pt)):
@@ -351,16 +360,24 @@ class GiantMidiDataset:
                 break
         raise FileNotFoundError(f"File with index {index} not found in {self.root}.")
 
-    def lookup_info(self, key: str, index: str | None = None) -> dict[str, typing.Any]:
+    def lookup_info(self, key: str) -> dict[str, typing.Any]:
+        """Look up information for a given key in the dataset. If index is provided, return the specific entry."""
+        if key in self._infos:
+            return self._infos[key]
+
         path = os.path.join(self.root, f"{key}.json")
         if not os.path.exists(path):
             raise FileNotFoundError(f"The key {key} doesn't exist")
         with open(path, 'r') as f:
             data = json.load(f)
-        if index is not None:
-            try:
-                d = data[index]
-                return d
-            except KeyError:
-                raise ValueError(f"The index ({index}) does not exist in the infos")
+        if not isinstance(data, dict):
+            raise ValueError(f"The data for key {key} is not a dictionary")
+        self._infos[key] = data
         return data
+
+    def lookup_info_idx(self, key: str, index: str) -> typing.Any:
+        """Look up a specific index in the dataset information."""
+        data = self.lookup_info(key)
+        if index not in data:
+            raise KeyError(f"Index {index} not found in data for key {key}")
+        return data[index]
