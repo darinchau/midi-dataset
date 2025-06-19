@@ -122,7 +122,6 @@ def main():
     # Wait here
     waiting_tqdm = tqdm(desc="Waiting for discount time to start...", unit="s")
     while not is_discount_time():
-        print("Waiting for discount time to start...")
         time.sleep(1)
         waiting_tqdm.update(1)
     waiting_tqdm.close()
