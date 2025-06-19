@@ -7,7 +7,6 @@ import dotenv
 from datetime import datetime
 from openai import OpenAI
 import os
-import matplotlib.pyplot as plt
 import time
 from src import GiantMidiDataset
 
@@ -146,3 +145,7 @@ def main():
                 print(f"Traceback: {traceback.format_exc()}")
     # response = labelling_deepseek("testdata", ["midi-classical-music", "bach-bwv001-_400_chorales-008807b.mid"])
     print("Labelling complete.")
+
+
+if __name__ == "__main__":
+    main()
