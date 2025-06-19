@@ -91,3 +91,4 @@ giant-midi-archive
 giant-midi-archive.zip
 data
 *.lprof
+*.npy

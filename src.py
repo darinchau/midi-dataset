@@ -242,6 +242,23 @@ class GiantMidiDataset:
         self._outliers: set[str] = set()
         self._infos: dict[str, dict[str, typing.Any]] = {}
 
+    @classmethod
+    def load(cls, path="./giant-midi-archive") -> GiantMidiDataset:
+        """A convenience method if you decide to put your dataset in the current directory and adds a nice little filter for you."""
+        def canonical_filter(ds: GiantMidiDataset, key: str):
+            max_delta = ds.lookup_info_idx("delta_time", key)
+            if max_delta >= 10:
+                return False
+            length = ds.lookup_info_idx("length", key)
+            if length > 3600:
+                return False
+            if length < 1:
+                return False
+            return True
+        ds = GiantMidiDataset(path)
+        ds.add_filter(canonical_filter)
+        return ds
+
     @property
     def root(self) -> str:
         return self._path
@@ -254,7 +271,7 @@ class GiantMidiDataset:
         unrar_path: str = "C:/Program Files/WinRAR/UnRAR.exe",
         name_str_len: int = 8,
         name_dir_hierachies: tuple[int, ...] = (1, 2, 3),
-    ) -> "GiantMidiDataset":
+    ) -> GiantMidiDataset:
         """Create a dataset from a directory."""
         if not os.path.exists(root):
             raise FileNotFoundError(f"Directory {root} does not exist.")
@@ -315,7 +332,7 @@ class GiantMidiDataset:
 
     @cached_property
     def num_files(self) -> int:
-        """Return the number of MIDI files in the dataset."""
+        """Return the number of MIDI files in the dataset (unfiltered)."""
         return len(self.get_all_paths())
 
     def __len__(self) -> int:
@@ -336,8 +353,8 @@ class GiantMidiDataset:
                 return True
         return False
 
-    def get_paths(self):
-        """Get all paths to MIDI files in the dataset, excluding outliers."""
+    def iter_paths(self):
+        """Iterate through all paths to MIDI files in the dataset, excluding outliers."""
         for path in self.get_all_paths():
             index = path.stem
             if not self.is_outlier(index):
