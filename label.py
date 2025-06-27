@@ -8,7 +8,7 @@ from datetime import datetime
 from openai import OpenAI
 import os
 import time
-from src import GiantMidiDataset
+import pandas as pd
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
@@ -102,11 +102,10 @@ def labelling_deepseek(key: str, mapping: list[str], existing_labels: dict[str, 
 
 
 def main():
-    ds = GiantMidiDataset.load()
-    mappings = ds.lookup_info("mapping")
+    df = pd.read_csv("./giant-midi-archive/mapping.csv", sep='\t')
 
     new_mappings = {}
-    for k, v in mappings.items():
+    for k, v in zip(df["index"], df["original_path"]):
         new_mappings[k] = v.split("\\")[2:]
 
     existing_labels: dict[str, list[str]] = {}

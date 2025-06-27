@@ -199,15 +199,23 @@ def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_di
     return mapping
 
 
-def pipeline(
-    base_directory="./data",
-    target_directory="./giant-midi-archive",
-    unrar_path="C:/Program Files/WinRAR/UnRAR.exe",  # Adjust this path as needed
-    exts=('.mid', '.midi'),
+def main(
+    root: str,
+    target_directory: str = "./giant-midi-archive",
+    exts: tuple[str, ...] = ('.mid', '.midi', '.kar', '.rmi'),
+    unrar_path: str = "C:/Program Files/WinRAR/UnRAR.exe",
     name_str_len: int = 8,
-    name_dir_hierachies: tuple[int, ...] = (1, 2, 3)
+    name_dir_hierachies: tuple[int, ...] = (3, 6),
 ):
+    """Create a dataset from a directory."""
+    if not os.path.exists(root):
+        raise FileNotFoundError(f"Directory {root} does not exist.")
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"{root} is not a directory.")
+
     json_file_path = os.path.join(target_directory, "mapping.json")
+
+    base_directory = "./data"
 
     midi_files = process_directory(base_directory, unrar_path, exts)
     logging.info(f"Found MIDI files: {len(midi_files)}")
@@ -222,183 +230,11 @@ def pipeline(
     logging.info(f"Mapping saved to JSON file at {json_file_path}")
 
 
-T = typing.TypeVar("T")
-
-
-class GiantMidiDataset:
-    def __init__(self, root: str):
-        self._path = root
-        self._filters: list[typing.Callable[[GiantMidiDataset, str], bool]] = []
-        self._outliers: set[str] = set()
-        self._infos: dict[str, dict[str, typing.Any]] = {}
-
-    @classmethod
-    def load(cls, path="./giant-midi-archive") -> GiantMidiDataset:
-        """A convenience method if you decide to put your dataset in the current directory and adds a nice little filter for you."""
-        def canonical_filter(ds: GiantMidiDataset, key: str):
-            max_delta = ds.lookup_info_idx("delta_time", key)
-            if max_delta >= 10:
-                return False
-            length = ds.lookup_info_idx("length", key)
-            if length > 3600:
-                return False
-            if length < 1:
-                return False
-            return True
-        ds = GiantMidiDataset(path)
-        ds.add_filter(canonical_filter)
-        return ds
-
-    @property
-    def root(self) -> str:
-        return self._path
-
-    @staticmethod
-    def make_from_directory(
-        root: str,
-        target_directory: str = "./giant-midi-archive",
-        exts: tuple[str, ...] = ('.mid', '.midi', '.kar', '.rmi'),
-        unrar_path: str = "C:/Program Files/WinRAR/UnRAR.exe",
-        name_str_len: int = 8,
-        name_dir_hierachies: tuple[int, ...] = (1, 2, 3),
-    ) -> GiantMidiDataset:
-        """Create a dataset from a directory."""
-        if not os.path.exists(root):
-            raise FileNotFoundError(f"Directory {root} does not exist.")
-        if not os.path.isdir(root):
-            raise NotADirectoryError(f"{root} is not a directory.")
-
-        pipeline(
-            base_directory=root,
-            target_directory=target_directory,
-            unrar_path=unrar_path,
-            exts=exts,
-            name_str_len=name_str_len,
-            name_dir_hierachies=name_dir_hierachies
-        )
-        return GiantMidiDataset(target_directory)
-
-    def get_all_paths(self) -> list[Path]:
-        """Return all paths to MIDI files in the dataset. This list is not filtered."""
-        paths = list(Path(self.root).rglob("*.mid")) + list(Path(self.root).rglob("*.midi"))
-        return paths
-
-    def accumulate(
-        self,
-        func: typing.Callable[[str], T],
-        num_threads: int = 4,
-        first_n: int = -1,
-    ) -> dict[str, T]:
-        """Accumulate values from the dataset."""
-        result: dict[str, T] = {}
-        files = self.get_all_paths()
-        if first_n > 0:
-            files = files[:first_n]
-        if num_threads > 1:
-            def process_chunk(chunk: list[Path], progress_bar: tqdm) -> dict[str, T]:
-                partial_result: dict[str, T] = {}
-                for file in chunk:
-                    p = func(str(file))
-                    index = file.stem
-                    partial_result[index] = p
-                    progress_bar.update(1)
-                return partial_result
-
-            # Split the files into equal-sized chunks
-            chunk_size = (len(files) + num_threads - 1) // num_threads
-            chunks = [files[i:i + chunk_size] for i in range(0, len(files), chunk_size)]
-
-            with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                with tqdm(total=len(files), desc="Accumulating files", unit="file") as progress_bar:
-                    futures = [executor.submit(process_chunk, chunk, progress_bar) for chunk in chunks]
-                    for future in futures:
-                        result.update(future.result())
-        else:
-            for file in tqdm(files, desc="Accumulating files", unit="file", total=len(files)):
-                p = func(str(file))
-                index = file.stem
-                result[index] = p
-        return result
-
-    @cached_property
-    def num_files(self) -> int:
-        """Return the number of MIDI files in the dataset (unfiltered)."""
-        return len(self.get_all_paths())
-
-    def __len__(self) -> int:
-        """Return the number of MIDI files in the dataset."""
-        return self.num_files
-
-    def add_filter(self, func: typing.Callable[[GiantMidiDataset, str], bool]) -> None:
-        """Add a filter function to the dataset. The function should accept the dataset and the path return True for files that should be included."""
-        self._filters.append(func)
-
-    def is_outlier(self, index: str) -> bool:
-        """Check if a file is an outlier based on the filters."""
-        if index in self._outliers:
-            return True
-        for f in self._filters:
-            if not f(self, index):
-                self._outliers.add(index)
-                return True
-        return False
-
-    def iter_paths(self):
-        """Iterate through all paths to MIDI files in the dataset, excluding outliers."""
-        for path in self.get_all_paths():
-            index = path.stem
-            if not self.is_outlier(index):
-                yield path
-
-    def get_path(self, index: str) -> str:
-        """Get the absolute path to a MIDI file in the dataset by its index. This does not filter the dataset."""
-        # Look through the giant-midi-archive directory for the file with the given index like a trie
-        # and return the path to that file.
-        path = [self.root]
-        while True:
-            p = os.path.join(*path)
-            for pt in os.listdir(p):
-                if index.startswith(pt) and os.path.isdir(os.path.join(*path, pt)):
-                    path.append(pt)
-                    break
-                elif pt.startswith(index) and os.path.isfile(os.path.join(*path, pt)):
-                    return os.path.abspath(os.path.join(*path, pt))
-            else:
-                break
-        raise FileNotFoundError(f"File with index {index} not found in {self.root}.")
-
-    def lookup_info(self, key: str) -> dict[str, typing.Any]:
-        """Look up information for a given key in the dataset. If index is provided, return the specific entry."""
-        if key in self._infos:
-            return self._infos[key]
-
-        path = os.path.join(self.root, f"{key}.json")
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"The key {key} doesn't exist")
-        with open(path, 'r') as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError(f"The data for key {key} is not a dictionary")
-        self._infos[key] = data
-        return data
-
-    def lookup_info_idx(self, key: str, index: str) -> typing.Any:
-        """Look up a specific index in the dataset information."""
-        data = self.lookup_info(key)
-        if index not in data:
-            raise KeyError(f"Index {index} not found in data for key {key}")
-        return data[index]
-
-
 if __name__ == "__main__":
     # Example usage
-    dataset = GiantMidiDataset.make_from_directory(
+    dataset = main(
         root="./data",
         target_directory="./giant-midi-archive-2",
         unrar_path="C:/Program Files/WinRAR/UnRAR.exe",
         exts=('.mid', '.midi', '.kar', '.rmi'),
-        name_str_len=8,
-        name_dir_hierachies=(1, 2, 3)
     )
-    print(f"Dataset created with {len(dataset)} MIDI files.")
-    print(f"First file path: {dataset.get_path('example_index')}")
