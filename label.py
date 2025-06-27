@@ -17,8 +17,8 @@ dotenv.load_dotenv()
 DEEPSEEK_API = os.getenv("DEEPSEEK_API_KEY")
 assert DEEPSEEK_API is not None, "Please set the DEEPSEEK_API_KEY environment variable."
 
-SAVE_PATH = "./giant-midi-archive/deepseek_labels_2.txt"
-USAGE_PATH = "./giant-midi-archive/deepseek_usage_2.txt"
+SAVE_PATH = "./giant-midi-archive/deepseek_labels_cleaned.txt"
+USAGE_PATH = "./giant-midi-archive/deepseek_usage.txt"
 file_lock = Lock()
 usage_lock = Lock()
 
@@ -34,10 +34,6 @@ def is_discount_time():
 def labelling_deepseek(key: str, mapping: list[str], existing_labels: dict[str, list[str]]):
     if key in existing_labels:
         tqdm.write(f"Skipping {key}, already labelled.")
-        return
-
-    if not is_discount_time():
-        tqdm.write(f"Skipping {key}, not within the allowed time range. We poor D:")
         return
 
     prompt = """You are a music expert. You are really good at inferring the music genre, style, mood, and other 
@@ -79,6 +75,10 @@ def labelling_deepseek(key: str, mapping: list[str], existing_labels: dict[str, 
 
     if response.choices and response.choices[0].message and response.choices[0].message.content:
         content = response.choices[0].message.content.strip()
+        if "\n" in content:
+            content = content.replace("\n", " -# ").strip()
+        if "\t" in content:
+            content = content.replace("\t", " -# ").strip()
         if content == "unknown":
             labels = ["unknown"]
         else:
@@ -94,6 +94,8 @@ def labelling_deepseek(key: str, mapping: list[str], existing_labels: dict[str, 
         misses = response.usage.prompt_cache_miss_tokens  # type: ignore
         completions = response.usage.completion_tokens
         money_one_billionth_usd = hits * 35 + misses * 35 + completions * 550
+        if not is_discount_time():
+            money_one_billionth_usd *= 2
         with usage_lock:
             with open(USAGE_PATH, "a", encoding='utf-8') as f:
                 f.write(f"{key}\t{hits}\t{misses}\t{completions}\t{money_one_billionth_usd}\n")
@@ -111,7 +113,13 @@ def main():
     if os.path.exists(SAVE_PATH):
         with open(SAVE_PATH, "r") as f:
             for line in f:
-                key, labels = line.strip().split("\t")
+                if not line.strip():
+                    continue
+                try:
+                    key, labels = line.strip().split("\t")
+                except ValueError as e:
+                    print(f"Error parsing line: {line.strip()}")
+                    raise e
                 existing_labels_key = labels.split(", ")
                 existing_labels[key] = [label.strip() for label in existing_labels_key if label.strip()]
 
@@ -119,23 +127,16 @@ def main():
         with open(USAGE_PATH, "w") as f:
             f.write("key\tprompt_cache_hit_tokens\tprompt_cache_miss_tokens\tcompletion_tokens\tmoney(1e-9USD)\n")
 
-    # Wait here
-    waiting_tqdm = tqdm(desc="Waiting for discount time to start...", unit="s")
     while not is_discount_time():
-        time.sleep(1)
-        waiting_tqdm.update(1)
-    waiting_tqdm.close()
+        print("Waiting for discount time (00:30 to 08:29)...")
+        time.sleep(60)
 
     with ThreadPoolExecutor() as executor:
         futures = []
         for key, mapping in tqdm(new_mappings.items(), desc="Creating jobs with DeepSeek"):
             if key in existing_labels:
                 continue
-            # Split half the job to another file
-            if key[0] not in "qwertyuiopasd":
-                continue
             futures.append(executor.submit(labelling_deepseek, key, mapping, existing_labels))
-
         for future in tqdm(as_completed(futures), total=len(futures), desc="Processing DeepSeek responses"):
             try:
                 future.result()

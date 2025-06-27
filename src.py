@@ -38,8 +38,8 @@ def _safe_write_json(data, filename):
     temp_fd, temp_path = tempfile.mkstemp()
 
     try:
-        with os.fdopen(temp_fd, 'w') as temp_file:
-            json.dump(data, temp_file, indent=4)
+        with os.fdopen(temp_fd, 'w', encoding='utf-8') as temp_file:
+            json.dump(data, temp_file, indent=4, ensure_ascii=False)
         shutil.move(temp_path, filename)
     except Exception as e:
         print(f"Failed to write data: {e}")
@@ -136,13 +136,9 @@ def deduplicate_files(file_paths: list[str], name_str_len: int = 8) -> dict:
                 return hashlib.md5(f.read()).hexdigest(), file_path
         except Exception as e:
             logging.error(f"Error reading file {file_path}: {e}")
-            return None, file_path
+            return "", file_path
 
-    def randomword(length):
-        letters = string.ascii_lowercase
-        return ''.join(random.choice(letters) for i in range(length))
-
-    hashes = defaultdict(list)
+    hashes: dict[str, list[str]] = defaultdict(list)
     with ThreadPoolExecutor() as executor:
         for file_hash, file_path in tqdm(
             executor.map(compute_hash, file_paths),
@@ -150,17 +146,15 @@ def deduplicate_files(file_paths: list[str], name_str_len: int = 8) -> dict:
             unit="file",
             total=len(file_paths)
         ):
-            if file_hash is not None:
+            if file_hash:
                 hashes[file_hash].append(file_path)
 
     logging.info(f"Found {len(hashes)} unique file hashes.")
 
     unique_files: dict[str, str] = {}
-    file_indices: set[str] = set()
     lock = Lock()
 
-    def process_collision(hash_val, paths):
-        nonlocal file_indices
+    def process_collision(hash_val: str, paths: list[str]):
         local_unique_files: dict[str, str] = {}
         unique_paths = []
         for i in range(len(paths)):
@@ -171,11 +165,7 @@ def deduplicate_files(file_paths: list[str], name_str_len: int = 8) -> dict:
                 unique_paths.append(paths[i])
         for path in unique_paths:
             with lock:
-                index = randomword(8)
-                while index in file_indices or any(index.startswith(x) for x in ILLEGAL_WINDOWS_NAMES):
-                    index = randomword(8)
-                file_indices.add(index)
-                local_unique_files[path] = index
+                local_unique_files[path] = hash_val
 
         return local_unique_files
 
@@ -398,3 +388,17 @@ class GiantMidiDataset:
         if index not in data:
             raise KeyError(f"Index {index} not found in data for key {key}")
         return data[index]
+
+
+if __name__ == "__main__":
+    # Example usage
+    dataset = GiantMidiDataset.make_from_directory(
+        root="./data",
+        target_directory="./giant-midi-archive-2",
+        unrar_path="C:/Program Files/WinRAR/UnRAR.exe",
+        exts=('.mid', '.midi', '.kar', '.rmi'),
+        name_str_len=8,
+        name_dir_hierachies=(1, 2, 3)
+    )
+    print(f"Dataset created with {len(dataset)} MIDI files.")
+    print(f"First file path: {dataset.get_path('example_index')}")
