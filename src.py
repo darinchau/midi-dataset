@@ -16,9 +16,8 @@ from multiprocessing import Lock as ProcessLock
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from tqdm import tqdm
 from pathlib import Path
-from typing import List
-from mido import MidiFile
-from functools import partial, reduce, cached_property
+import pandas as pd
+import argparse
 
 # Configure logging
 logging.basicConfig(
@@ -128,7 +127,7 @@ def process_directory(base_path: str, unrar_path: str, exts: tuple[str, ...]) ->
     return find_midi_files(base_path, exts=exts)
 
 
-def deduplicate_files(file_paths: list[str], name_str_len: int = 8) -> dict:
+def deduplicate_files(file_paths: list[str], n_processes: int = 1) -> dict:
     """Remove duplicate files based on file content, adding a progress bar for hashing, and return a mapping of original to new file paths."""
     def compute_hash(file_path):
         try:
@@ -139,49 +138,64 @@ def deduplicate_files(file_paths: list[str], name_str_len: int = 8) -> dict:
             return "", file_path
 
     hashes: dict[str, list[str]] = defaultdict(list)
-    with ThreadPoolExecutor() as executor:
-        for file_hash, file_path in tqdm(
-            executor.map(compute_hash, file_paths),
-            desc="Hashing files",
-            unit="file",
-            total=len(file_paths)
-        ):
+
+    if n_processes == 0:
+        # Single-threaded hashing
+        for file_path in tqdm(file_paths, desc="Hashing files", unit="file"):
+            file_hash, path = compute_hash(file_path)
             if file_hash:
-                hashes[file_hash].append(file_path)
+                hashes[file_hash].append(path)
+    else:
+        # Multi-threaded hashing
+        with ThreadPoolExecutor(max_workers=n_processes) as executor:
+            for file_hash, file_path in tqdm(
+                executor.map(compute_hash, file_paths),
+                desc="Hashing files",
+                unit="file",
+                total=len(file_paths)
+            ):
+                if file_hash:
+                    hashes[file_hash].append(file_path)
 
     logging.info(f"Found {len(hashes)} unique file hashes.")
 
     unique_files: dict[str, str] = {}
-    lock = Lock()
+
+    paths_with_deepseek_labels: set[str] = set()
+    with open("./data/mapping.json", "r", encoding="utf-8") as f:
+        deepseek_mapping = json.load(f)
+        for path in deepseek_mapping.values():
+            paths_with_deepseek_labels.add(path)
 
     def process_collision(hash_val: str, paths: list[str]):
         local_unique_files: dict[str, str] = {}
-        unique_paths = []
-        for i in range(len(paths)):
-            for j in range(i):
-                if filecmp.cmp(paths[i], paths[j], shallow=False):
+        if any(path in paths_with_deepseek_labels for path in paths):
+            for path in paths:
+                if path in paths_with_deepseek_labels:
+                    local_unique_files[path] = hash_val
                     break
-            else:
-                unique_paths.append(paths[i])
-        for path in unique_paths:
-            with lock:
-                local_unique_files[path] = hash_val
-
+        else:
+            first_path = paths[0]
+            local_unique_files[first_path] = hash_val
         return local_unique_files
 
-    with ThreadPoolExecutor() as executor:
-        results = list(
-            tqdm(
-                executor.map(lambda item: process_collision(*item), hashes.items()),
-                desc="Processing collisions",
-                unit="group",
-                total=len(hashes),
+    if n_processes == 0:
+        # Single-threaded collision processing
+        for hash_val, paths in tqdm(hashes.items(), desc="Processing collisions", unit="group"):
+            unique_files.update(process_collision(hash_val, paths))
+    else:
+        # Multi-threaded collision processing
+        with ThreadPoolExecutor(max_workers=n_processes) as executor:
+            results = list(
+                tqdm(
+                    executor.map(lambda item: process_collision(*item), hashes.items()),
+                    desc="Processing collisions",
+                    unit="group",
+                    total=len(hashes),
+                )
             )
-        )
-
-    for result in results:
-        unique_files.update(result)
-
+        for result in results:
+            unique_files.update(result)
     return unique_files
 
 
@@ -199,42 +213,52 @@ def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_di
     return mapping
 
 
-def main(
-    root: str,
-    target_directory: str = "./giant-midi-archive",
-    exts: tuple[str, ...] = ('.mid', '.midi', '.kar', '.rmi'),
-    unrar_path: str = "C:/Program Files/WinRAR/UnRAR.exe",
-    name_str_len: int = 8,
-    name_dir_hierachies: tuple[int, ...] = (3, 6),
-):
+def main(root: str, target_directory: str, exts: tuple[str, ...], unrar_path: str, name_dir_hierachies: tuple[int, ...], n_processes: int):
     """Create a dataset from a directory."""
     if not os.path.exists(root):
         raise FileNotFoundError(f"Directory {root} does not exist.")
     if not os.path.isdir(root):
         raise NotADirectoryError(f"{root} is not a directory.")
 
-    json_file_path = os.path.join(target_directory, "mapping.json")
+    json_file_path = os.path.join(target_directory, "mapping.csv")
 
     base_directory = "./data"
 
     midi_files = process_directory(base_directory, unrar_path, exts)
     logging.info(f"Found MIDI files: {len(midi_files)}")
 
-    unique_files = deduplicate_files(midi_files, name_str_len=name_str_len)
+    unique_files = deduplicate_files(midi_files, n_processes=n_processes)
     logging.info(f"Unique MIDI files after deduplication: {len(unique_files)}")
 
     mapping = copy_and_rename_files(unique_files, target_directory, name_dir_hierachies)
     logging.info(f"Files copied and renamed. Total: {len(mapping)}")
 
-    _safe_write_json(mapping, json_file_path)
-    logging.info(f"Mapping saved to JSON file at {json_file_path}")
+    indices: list[str] = sorted(mapping.keys())
+    values: list[str] = [mapping[index] for index in indices]
+    df = pd.DataFrame({
+        "index": indices,
+        "original_path": values
+    })
+    df.to_csv(json_file_path, index=False, sep="\t", encoding="utf-8")
+    logging.info(f"Mapping saved to CSV file at {json_file_path}")
 
 
 if __name__ == "__main__":
     # Example usage
+    parser = argparse.ArgumentParser(description="Create a MIDI dataset from a directory.")
+    parser.add_argument("--root", type=str, default="./data", help="Root directory to process.")
+    parser.add_argument("--target_directory", type=str, default="E:/giant-midi-archive", help="Target directory for the dataset.")
+    parser.add_argument("--unrar_path", type=str, default="C:/Program Files/WinRAR/UnRAR.exe", help="Path to the UnRAR executable.")
+    parser.add_argument("--exts", type=str, nargs="+", default=['.mid', '.midi'], help="MIDI file extensions to include.")
+    parser.add_argument("--n_processes", type=int, default=4, help="Number of processes for parallel processing.")
+
+    args = parser.parse_args()
+
     dataset = main(
-        root="./data",
-        target_directory="./giant-midi-archive-2",
-        unrar_path="C:/Program Files/WinRAR/UnRAR.exe",
-        exts=('.mid', '.midi', '.kar', '.rmi'),
+        root=args.root,
+        target_directory=args.target_directory,
+        unrar_path=args.unrar_path,
+        exts=tuple(args.exts),
+        n_processes=args.n_processes,
+        name_dir_hierachies=(2, 4)
     )
