@@ -17,8 +17,6 @@ dotenv.load_dotenv()
 DEEPSEEK_API = os.getenv("DEEPSEEK_API_KEY")
 assert DEEPSEEK_API is not None, "Please set the DEEPSEEK_API_KEY environment variable."
 
-SAVE_PATH = "./giant-midi-archive/deepseek_labels_cleaned.txt"
-USAGE_PATH = "./giant-midi-archive/deepseek_usage.txt"
 file_lock = Lock()
 usage_lock = Lock()
 
@@ -31,7 +29,7 @@ def is_discount_time():
     return current_time >= datetime.strptime("00:30", "%H:%M").time() and current_time <= datetime.strptime("08:29", "%H:%M").time()
 
 
-def labelling_deepseek(key: str, mapping: list[str], existing_labels: dict[str, list[str]]):
+def labelling_deepseek(key: str, save_path: str, usage_path: str, mapping: list[str], existing_labels: dict[str, list[str]]):
     if key in existing_labels:
         tqdm.write(f"Skipping {key}, already labelled.")
         return
@@ -86,7 +84,7 @@ def labelling_deepseek(key: str, mapping: list[str], existing_labels: dict[str, 
         labels = [x for x in labels if x]
         existing_labels[key] = labels
         with file_lock:
-            with open(SAVE_PATH, "a", encoding='utf-8') as f:
+            with open(save_path, "a", encoding='utf-8') as f:
                 f.write(f"{key}\t{', '.join(labels)}\n")
 
     if response.usage is not None:
@@ -97,20 +95,23 @@ def labelling_deepseek(key: str, mapping: list[str], existing_labels: dict[str, 
         if not is_discount_time():
             money_one_billionth_usd *= 2
         with usage_lock:
-            with open(USAGE_PATH, "a", encoding='utf-8') as f:
+            with open(usage_path, "a", encoding='utf-8') as f:
                 f.write(f"{key}\t{hits}\t{misses}\t{completions}\t{money_one_billionth_usd}\n")
 
 
-def main():
-    df = pd.read_csv("./giant-midi-archive/mapping.csv", sep='\t')
+def main(root: str):
+    df = pd.read_csv(os.path.join(root, "mapping.csv"), sep='\t')
+
+    save_path = os.path.join(root, "deepseek_labels.txt")
+    usage_path = os.path.join(root, "deepseek_usage.txt")
 
     new_mappings = {}
     for k, v in zip(df["index"], df["original_path"]):
         new_mappings[k] = v.split("\\")[2:]
 
     existing_labels: dict[str, list[str]] = {}
-    if os.path.exists(SAVE_PATH):
-        with open(SAVE_PATH, "r") as f:
+    if os.path.exists(save_path):
+        with open(save_path, "r") as f:
             for line in f:
                 if not line.strip():
                     continue
@@ -122,8 +123,8 @@ def main():
                 existing_labels_key = labels.split(", ")
                 existing_labels[key] = [label.strip() for label in existing_labels_key if label.strip()]
 
-    if not os.path.exists(USAGE_PATH):
-        with open(USAGE_PATH, "w") as f:
+    if not os.path.exists(usage_path):
+        with open(usage_path, "w") as f:
             f.write("key\tprompt_cache_hit_tokens\tprompt_cache_miss_tokens\tcompletion_tokens\tmoney(1e-9USD)\n")
 
     while not is_discount_time():
@@ -135,7 +136,7 @@ def main():
         for key, mapping in tqdm(new_mappings.items(), desc="Creating jobs with DeepSeek"):
             if key in existing_labels:
                 continue
-            futures.append(executor.submit(labelling_deepseek, key, mapping, existing_labels))
+            futures.append(executor.submit(labelling_deepseek, key, save_path, usage_path, mapping, existing_labels))
         for future in tqdm(as_completed(futures), total=len(futures), desc="Processing DeepSeek responses"):
             try:
                 future.result()
@@ -147,4 +148,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main("E:/giant-midi-archive")

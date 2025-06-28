@@ -121,12 +121,6 @@ def find_midi_files(
     return midi_files
 
 
-def process_directory(base_path: str, unrar_path: str, exts: tuple[str, ...]) -> list[str]:
-    """Extracts all archives and returns a list of MIDI file paths."""
-    extract_archives(base_path, unrar_path)
-    return find_midi_files(base_path, exts=exts)
-
-
 def deduplicate_files(file_paths: list[str], n_processes: int = 1) -> dict:
     """Remove duplicate files based on file content, adding a progress bar for hashing, and return a mapping of original to new file paths."""
     def compute_hash(file_path):
@@ -199,18 +193,25 @@ def deduplicate_files(file_paths: list[str], n_processes: int = 1) -> dict:
     return unique_files
 
 
-def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_dir_hierachies: tuple[int, ...]) -> dict:
+def make_mapping(unique_files: dict[str, str], json_file_path: str):
+    mapping = {v: k for k, v in unique_files.items()}
+    indices: list[str] = sorted(mapping.keys())
+    values: list[str] = [mapping[index] for index in indices]
+    df = pd.DataFrame({
+        "index": indices,
+        "original_path": values
+    })
+    df.to_csv(json_file_path, index=False, sep="\t", encoding="utf-8")
+
+
+def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_dir_hierachies: tuple[int, ...]):
     """Copy files to a new directory with new names and return a mapping of new names to original paths."""
-    os.makedirs(target_dir, exist_ok=True)
-    mapping = {}
     for original_path, index in tqdm(unique_files.items(), desc="Copying files", unit="file"):
         new_name = f"{index}.mid"
         parent_dirs = [index[:i] for i in name_dir_hierachies]
         new_path = os.path.join(target_dir, *parent_dirs, new_name)
         os.makedirs(os.path.dirname(new_path), exist_ok=True)
         shutil.copyfile(original_path, new_path)
-        mapping[index] = original_path
-    return mapping
 
 
 def main(root: str, target_directory: str, exts: tuple[str, ...], unrar_path: str, name_dir_hierachies: tuple[int, ...], n_processes: int):
@@ -220,27 +221,24 @@ def main(root: str, target_directory: str, exts: tuple[str, ...], unrar_path: st
     if not os.path.isdir(root):
         raise NotADirectoryError(f"{root} is not a directory.")
 
-    json_file_path = os.path.join(target_directory, "mapping.csv")
+    csv_file_path = os.path.join(target_directory, "mapping.csv")
 
     base_directory = "./data"
 
-    midi_files = process_directory(base_directory, unrar_path, exts)
+    extract_archives(base_directory, unrar_path)
+    midi_files = find_midi_files(base_directory, exts=exts)
     logging.info(f"Found MIDI files: {len(midi_files)}")
 
     unique_files = deduplicate_files(midi_files, n_processes=n_processes)
     logging.info(f"Unique MIDI files after deduplication: {len(unique_files)}")
 
-    mapping = copy_and_rename_files(unique_files, target_directory, name_dir_hierachies)
-    logging.info(f"Files copied and renamed. Total: {len(mapping)}")
+    os.makedirs(target_directory, exist_ok=True)
 
-    indices: list[str] = sorted(mapping.keys())
-    values: list[str] = [mapping[index] for index in indices]
-    df = pd.DataFrame({
-        "index": indices,
-        "original_path": values
-    })
-    df.to_csv(json_file_path, index=False, sep="\t", encoding="utf-8")
-    logging.info(f"Mapping saved to CSV file at {json_file_path}")
+    make_mapping(unique_files, csv_file_path)
+    logging.info(f"Mapping saved to CSV file at {csv_file_path}")
+
+    copy_and_rename_files(unique_files, target_directory, name_dir_hierachies)
+    logging.info(f"Files copied and renamed. Total: {len(unique_files)}")
 
 
 if __name__ == "__main__":
