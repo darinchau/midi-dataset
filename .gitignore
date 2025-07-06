@@ -92,3 +92,4 @@ giant-midi-archive*.zip
 data
 *.lprof
 *.npy
+*.zip

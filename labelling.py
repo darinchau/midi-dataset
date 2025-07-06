@@ -1,22 +1,22 @@
+# This script stores all the scripts that have been used to analyse metadata and label MIDI files in the Giant MIDI Archive.
+# And maybe in the process exports a few useful ones
 import pandas as pd
 import os
 import json
 from tqdm import tqdm
-
-# Stores all the functions that have been used to create labels for the dataset.
-# Maybe exports a few useful ones idk
+from util import get_path
 
 
-def load_mapping():
-    df = pd.read_csv(os.path.join("E:/giant-midi-archive/mapping.csv"), sep='\t')
+def load_mapping(root: str) -> pd.DataFrame:
+    df = pd.read_csv(os.path.join(root, "mapping.csv"), sep='\t')
     df['original_path'] = df['original_path'].apply(lambda x: x.replace("\\", "/"))
     return df
 
 
-def create_aria_labels(df: pd.DataFrame):
+def create_aria_labels(raw_data_path: str, df: pd.DataFrame):
     print(f"Creating aria labels for {len(df)} files...")
 
-    with open("data/v2/aria-midi-v1-ext/aria-midi-v1-ext/metadata.json", 'r') as f:
+    with open(os.path.join(raw_data_path, "/v2/aria-midi-v1-ext/aria-midi-v1-ext/metadata.json"), 'r') as f:
         metadata = json.load(f)
     df['aria_midi_number'] = df['original_path'].apply(lambda x: os.path.basename(x).split("_")[0] if "aria-midi-v1-ext" in x else "")
 
@@ -46,9 +46,9 @@ def create_aria_labels(df: pd.DataFrame):
     return df
 
 
-def create_deepseek_labels(df: pd.DataFrame):
+def create_deepseek_labels(root: str, df: pd.DataFrame):
     print(f"Creating deepseek labels for {len(df)} files...")
-    infos = pd.read_csv("E:/giant-midi-archive/info.csv", sep='\t')
+    infos = pd.read_csv(os.path.join(root, "info.csv"), sep='\t')
     df1 = df.merge(infos, on='original_path', how='outer')
     df1['deepseek_desc'] = df1['deepseek_desc'].replace(pd.NA, '', regex=True)
     df1 = df1.fillna('')
@@ -56,7 +56,7 @@ def create_deepseek_labels(df: pd.DataFrame):
     return df1
 
 
-def create_lengths(df: pd.DataFrame):
+def create_lengths(root: str, df: pd.DataFrame):
     import pretty_midi
 
     def midi_file_length(root: str, index: str) -> float:
@@ -70,22 +70,22 @@ def create_lengths(df: pd.DataFrame):
 
     tqdm.pandas()
 
-    df['length'] = df['index'].progress_map(lambda idx: midi_file_length("E:/giant-midi-archive", idx))
+    df['length'] = df['index'].progress_map(lambda idx: midi_file_length(root, idx))
     return df
 
 
-def get_path(root: str, index: str) -> str:
-    # Look through the giant-midi-archive directory for the file with the given index like a trie
-    # and return the path to that file.
-    path = [root]
-    while True:
-        p = os.path.join(*path)
-        for pt in os.listdir(p):
-            if index.startswith(pt) and os.path.isdir(os.path.join(*path, pt)):
-                path.append(pt)
-                break
-            elif pt.startswith(index) and os.path.isfile(os.path.join(*path, pt)):
-                return os.path.join(*path, pt)
-        else:
-            break
-    raise FileNotFoundError(f"File with index {index} not found in {root}.")
+def get_note_counts(root: str, df: pd.DataFrame):
+    import pretty_midi
+
+    def count_notes_in_midi(midi_file_path: str):
+        try:
+            midi_data = pretty_midi.PrettyMIDI(midi_file_path)
+            note_count = 0
+            for instrument in midi_data.instruments:
+                note_count += len(instrument.notes)
+            return note_count
+        except Exception as e:
+            return -1
+    tqdm.pandas(desc="Counting notes...")
+    df['note_count'] = df['index'].progress_apply(lambda x: count_notes_in_midi(get_path(root, x)))
+    return df

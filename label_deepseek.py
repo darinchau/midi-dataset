@@ -1,3 +1,4 @@
+# This script labels MIDI files using the DeepSeek API based on their metadata which is essetially the path to the file.
 import logging
 import traceback
 from threading import Lock

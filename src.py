@@ -121,7 +121,7 @@ def find_midi_files(
     return midi_files
 
 
-def deduplicate_files(file_paths: list[str], n_processes: int = 1) -> dict:
+def deduplicate_files(root: str, file_paths: list[str], n_processes: int = 1) -> dict:
     """Remove duplicate files based on file content, adding a progress bar for hashing, and return a mapping of original to new file paths."""
     def compute_hash(file_path):
         try:
@@ -153,13 +153,7 @@ def deduplicate_files(file_paths: list[str], n_processes: int = 1) -> dict:
 
     logging.info(f"Found {len(hashes)} unique file hashes.")
 
-    unique_files: dict[str, str] = {}
-
-    paths_with_deepseek_labels: set[str] = set()
-    with open("./data/mapping.json", "r", encoding="utf-8") as f:
-        deepseek_mapping = json.load(f)
-        for path in deepseek_mapping.values():
-            paths_with_deepseek_labels.add(path)
+    assert False, "TODO: Implement logic that skips the files that are already in the dataset. Remember to handle hash collisions correctly"
 
     def process_collision(hash_val: str, paths: list[str]):
         local_unique_files: dict[str, str] = {}
@@ -193,7 +187,8 @@ def deduplicate_files(file_paths: list[str], n_processes: int = 1) -> dict:
     return unique_files
 
 
-def make_mapping(unique_files: dict[str, str], json_file_path: str):
+def make_mapping(unique_files: dict[str, str], csv_file_path: str):
+    assert False, "TODO: evaluate whether we need to handle the case where the mapping csv already exists"
     mapping = {v: k for k, v in unique_files.items()}
     indices: list[str] = sorted(mapping.keys())
     values: list[str] = [mapping[index] for index in indices]
@@ -201,7 +196,7 @@ def make_mapping(unique_files: dict[str, str], json_file_path: str):
         "index": indices,
         "original_path": values
     })
-    df.to_csv(json_file_path, index=False, sep="\t", encoding="utf-8")
+    df.to_csv(csv_file_path, index=False, sep="\t", encoding="utf-8")
 
 
 def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_dir_hierachies: tuple[int, ...]):
@@ -215,7 +210,10 @@ def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_di
 
 
 def main(root: str, target_directory: str, exts: tuple[str, ...], unrar_path: str, name_dir_hierachies: tuple[int, ...], n_processes: int):
-    """Create a dataset from a directory."""
+    """Create a dataset from a directory.
+
+    The target directory can be an existing dataset. We will try to process only the new files that are added since the last run.
+    The existing labels will be matched to their MD5 hashes and labels will be updated accordingly."""
     if not os.path.exists(root):
         raise FileNotFoundError(f"Directory {root} does not exist.")
     if not os.path.isdir(root):
@@ -229,7 +227,7 @@ def main(root: str, target_directory: str, exts: tuple[str, ...], unrar_path: st
     midi_files = find_midi_files(base_directory, exts=exts)
     logging.info(f"Found MIDI files: {len(midi_files)}")
 
-    unique_files = deduplicate_files(midi_files, n_processes=n_processes)
+    unique_files = deduplicate_files(target_directory, midi_files, n_processes=n_processes)
     logging.info(f"Unique MIDI files after deduplication: {len(unique_files)}")
 
     os.makedirs(target_directory, exist_ok=True)
