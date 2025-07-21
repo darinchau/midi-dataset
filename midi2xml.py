@@ -11,7 +11,6 @@ INPUT_DIR = r"E:\data\giant-midi-archive"
 OUTPUT_DIR = r"E:\data\giant-test-archive"
 MUSESCORE_CLI = r"C:\Program Files\MuseScore 4\bin\MuseScore4.exe"
 LOGS_DIR = "./logs.txt"
-lock = Lock()
 
 
 def iterate_midi_files(input_dir: str, output_dir: str):
@@ -36,18 +35,14 @@ def convert_one_file(midi_path: Path, output_path: Path):
         result = subprocess.run([MUSESCORE_CLI, "-o", str(output_path), str(midi_path)], capture_output=True, text=True)
         return result.returncode == 0
     except Exception as e:
-        with lock:
-            with open(LOGS_DIR, 'a') as log_file:
-                log_file.write(f"Error converting {midi_path}: {(type(e))} {str(e)}\n")
+        try:
+            tqdm.write(f"Error converting {midi_path}: {e}")
+        except Exception as e2:
+            f"Error converting {midi_path}: {e}"
         return False
 
 
 def main():
-    # Refresh the logs file
-    with open(LOGS_DIR, 'w') as log_file:
-        log_file.write(f"Conversion started at: {datetime.now()}\n")
-    print(f"Logs will be saved to {LOGS_DIR}")
-
     with ProcessPoolExecutor(max_workers=8) as pool:
         futures = {
             pool.submit(convert_one_file, midi_path, output_path): midi_path
@@ -59,13 +54,9 @@ def main():
             try:
                 success = future.result()
                 if not success:
-                    with lock:
-                        with open(LOGS_DIR, 'a') as log_file:
-                            log_file.write(f"Failed to convert {midi_path}\n")
+                    tqdm.write(f"Failed to convert {midi_path}")
             except Exception as e:
-                with lock:
-                    with open(LOGS_DIR, 'a') as log_file:
-                        log_file.write(f"Exception for {midi_path}: {str(e)}\n")
+                tqdm.write(f"Exception occurred while converting {midi_path}: {e}")
 
 
 if __name__ == "__main__":
