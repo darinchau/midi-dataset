@@ -48,9 +48,24 @@ def main():
         log_file.write(f"Conversion started at: {datetime.now()}\n")
     print(f"Logs will be saved to {LOGS_DIR}")
 
-    for input_path, output_path in tqdm(iterate_midi_files(INPUT_DIR, OUTPUT_DIR), desc="Preparing MIDI files"):
-        if not convert_one_file(input_path, output_path):
-            tqdm.write(f"Failed to convert {input_path}.")
+    with ProcessPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(convert_one_file, midi_path, output_path): midi_path
+            for midi_path, output_path in iterate_midi_files(INPUT_DIR, OUTPUT_DIR)
+        }
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Converting MIDI files"):
+            midi_path = futures[future]
+            try:
+                success = future.result()
+                if not success:
+                    with lock:
+                        with open(LOGS_DIR, 'a') as log_file:
+                            log_file.write(f"Failed to convert {midi_path}\n")
+            except Exception as e:
+                with lock:
+                    with open(LOGS_DIR, 'a') as log_file:
+                        log_file.write(f"Exception for {midi_path}: {str(e)}\n")
 
 
 if __name__ == "__main__":
