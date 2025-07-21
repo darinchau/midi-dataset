@@ -93,3 +93,4 @@ data
 *.lprof
 *.npy
 *.zip
+logs.txt
