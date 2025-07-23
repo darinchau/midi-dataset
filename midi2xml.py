@@ -11,8 +11,6 @@ import sys
 
 INPUT_DIR = r"E:\data\giant-midi-archive"
 OUTPUT_DIR = r"E:\data\giant-test-archive"
-MUSESCORE_CLI = r"C:\Program Files\MuseScore 4\bin\MuseScore4.exe"
-LOGS_DIR = "./logs.txt"
 
 
 def iterate_midi_files(input_dir: str, output_dir: str, limit: int | None = None):
@@ -71,8 +69,9 @@ def main():
         print("Number of workers must be a positive integer.")
         sys.exit(1)
 
+    paths = tqdm(iterate_midi_files(INPUT_DIR, OUTPUT_DIR, limit=limit), desc="Iterating MIDI files")
     if workers == 0:
-        for midi_path, output_path in tqdm(iterate_midi_files(INPUT_DIR, OUTPUT_DIR, limit=limit), desc="Converting MIDI files"):
+        for midi_path, output_path in paths:
             success = convert_one_file(midi_path, output_path)
             if not success:
                 tqdm.write(f"Failed to convert {midi_path}")
@@ -81,7 +80,7 @@ def main():
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(convert_one_file, midi_path, output_path): midi_path
-                for midi_path, output_path in iterate_midi_files(INPUT_DIR, OUTPUT_DIR, limit=limit)
+                for midi_path, output_path in paths
             }
 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Converting MIDI files"):
