@@ -66,7 +66,7 @@ def main():
         sys.exit(1)
 
     workers = args.workers
-    assert isinstance(workers, int) and workers > 0, "Number of workers must be a positive integer."
+    assert isinstance(workers, int) and workers >= 0, "Number of workers must be a positive integer."
     if workers < 0:
         print("Number of workers must be a positive integer.")
         sys.exit(1)
