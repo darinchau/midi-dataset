@@ -11,8 +11,9 @@ class MusicXMLNote:
     pitch: int
     start: float  # seconds
     duration: float  # seconds
-    index: int
+    index: int  # line of fifths index
     octave: int
+    velocity: int  # MIDI velocity (0-127)
 
 
 def _step_alter_to_lof_index(step: str, alter: int) -> int:
@@ -27,7 +28,21 @@ def _lof_index_to_step_alter(index: int) -> tuple[str, int]:
     return step, alter
 
 
-def parse_musicxml(xml_path: str, debug=True):
+def dynamics_to_velocity(dynamics_tag: str) -> int:
+    """
+    Convert musical dynamics notation to MIDI velocity.
+    """
+    dynamics_map = {
+        'pppp': 8, 'ppp': 20, 'pp': 33, 'p': 45,
+        'mp': 60, 'mf': 75, 'f': 88, 'ff': 103,
+        'fff': 117, 'ffff': 127,
+        'sf': 100, 'sfz': 100, 'sffz': 115,
+        'fp': 88, 'rfz': 100, 'rf': 100
+    }
+    return dynamics_map.get(dynamics_tag, 80)  # Default to mezzo-forte
+
+
+def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
     """
     Manually parse MusicXML and create 3D piano roll with debug output.
     Raises an error if the file is not a valid MusicXML.
@@ -45,6 +60,7 @@ def parse_musicxml(xml_path: str, debug=True):
     # Default tempo
     tempo_bpm = 120
     divisions = 1
+    current_dynamics = 80  # Default velocity (mf)
 
     # Find tempo and divisions
     for element in root.iter():
@@ -58,7 +74,7 @@ def parse_musicxml(xml_path: str, debug=True):
                 print(f"Tempo: {tempo_bpm} BPM")
 
     # Collect all notes with their timing and instrument info
-    notes_data = []
+    notes_data: list[MusicXMLNote] = []
     current_time = 0
     current_instrument = 0
 
@@ -92,12 +108,23 @@ def parse_musicxml(xml_path: str, debug=True):
             if debug and measure.get('number'):
                 print(f"\n  Measure {measure.get('number')}:")
 
+            # Check for dynamics changes in this measure
+            for direction in measure.findall('.//direction'):
+                dynamics = direction.find('.//dynamics')
+                if dynamics is not None:
+                    for dyn in dynamics:
+                        current_dynamics = dynamics_to_velocity(dyn.tag)
+                        if debug:
+                            print(f"    Dynamics change: {dyn.tag} (velocity: {current_dynamics})")
+
             for element in measure:
                 if element.tag == 'note':
                     pitch_elem = element.find('pitch')
                     if pitch_elem is not None:
                         # Get pitch components
                         step = pitch_elem.find('step').text
+                        assert step in {'C', 'D', 'E', 'F', 'G', 'A', 'B'}, f"Invalid step: {step}"
+
                         octave = int(pitch_elem.find('octave').text)
                         alter_elem = pitch_elem.find('alter')
                         alter = int(alter_elem.text) if alter_elem is not None else 0
@@ -108,6 +135,21 @@ def parse_musicxml(xml_path: str, debug=True):
 
                         # Get duration
                         duration_ticks = int(element.find('duration').text)
+
+                        # Get velocity - first check for explicit velocity element
+                        velocity = current_dynamics
+                        velocity_elem = element.find('velocity')
+                        if velocity_elem is not None:
+                            velocity = int(velocity_elem.text)
+                        else:
+                            # Check for dynamics in notations
+                            notations = element.find('notations')
+                            if notations is not None:
+                                dynamics = notations.find('.//dynamics')
+                                if dynamics is not None:
+                                    for dyn in dynamics:
+                                        velocity = dynamics_to_velocity(dyn.tag)
+                                        current_dynamics = velocity  # Update current dynamics
 
                         # Convert to seconds
                         quarter_length = duration_ticks / divisions
@@ -124,6 +166,7 @@ def parse_musicxml(xml_path: str, debug=True):
                             print(f"      - Octave: {octave}")
                             print(f"      - MIDI Note Number: {midi_note}")
                             print(f"      - Instrument: {current_instrument}")
+                            print(f"      - Velocity: {velocity}")
                             print(f"      - Onset(ticks): {current_time}")
                             print(f"      - Onset: {start_seconds:.3f} seconds")
                             print(f"      - Duration: {duration_seconds:.3f} seconds")
@@ -135,13 +178,6 @@ def parse_musicxml(xml_path: str, debug=True):
                             if voice is not None:
                                 print(f"      - Voice: {voice.text}")
 
-                            notations = element.find('notations')
-                            if notations is not None:
-                                dynamics = notations.find('.//dynamics')
-                                if dynamics is not None:
-                                    for dyn in dynamics:
-                                        print(f"      - Dynamics: {dyn.tag}")
-
                         notes_data.append(MusicXMLNote(
                             instrument=current_instrument,
                             pitch=midi_note,
@@ -149,6 +185,7 @@ def parse_musicxml(xml_path: str, debug=True):
                             duration=duration_seconds,
                             index=_step_alter_to_lof_index(step, alter),
                             octave=octave,
+                            velocity=velocity,
                         ))
 
                     # Update time if not a chord
@@ -180,11 +217,13 @@ def parse_musicxml(xml_path: str, debug=True):
         print(f"SUMMARY:")
         print(f"Total notes parsed: {len(notes_data)}")
         if notes_data:
-            print(f"Time range: 0.000 - {max(n['start'] + n['duration'] for n in notes_data):.3f} seconds")
-            instruments_used = set(n['instrument'] for n in notes_data)
+            print(f"Time range: 0.000 - {max(n.start + n.duration for n in notes_data):.3f} seconds")
+            instruments_used = set(n.instrument for n in notes_data)
             print(f"Instruments used: {sorted(instruments_used)}")
-            pitch_range = [min(n['pitch'] for n in notes_data), max(n['pitch'] for n in notes_data)]
+            pitch_range = [min(n.pitch for n in notes_data), max(n.pitch for n in notes_data)]
             print(f"Pitch range: MIDI {pitch_range[0]} - {pitch_range[1]}")
+            velocity_range = [min(n.velocity for n in notes_data), max(n.velocity for n in notes_data)]
+            print(f"Velocity range: {velocity_range[0]} - {velocity_range[1]}")
         print("="*80 + "\n")
 
     return notes_data
@@ -232,7 +271,8 @@ def notes_data_to_piano_roll(notes_data: list[MusicXMLNote], steps_per_second=24
     max_time = max(n.start + n.duration for n in notes_data)
     total_steps = int(np.ceil(max_time * steps_per_second))
 
-    piano_roll_3d = np.zeros((128, 128, total_steps), dtype=np.uint8)
+    # Changed from uint8 to float32 to store velocity values
+    piano_roll_3d = np.zeros((128, 128, total_steps), dtype=np.float32)
 
     for note in notes_data:
         instrument = max(0, min(127, note.instrument))
@@ -240,8 +280,11 @@ def notes_data_to_piano_roll(notes_data: list[MusicXMLNote], steps_per_second=24
         start_step = int(note.start * steps_per_second)
         end_step = int((note.start + note.duration) * steps_per_second)
 
+        # Convert MIDI velocity (0-127) to 0-1 range
+        velocity_normalized = note.velocity / 127.0
+
         if start_step < total_steps:
             end_step = min(end_step, total_steps)
-            piano_roll_3d[instrument, pitch, start_step:end_step] = 1
+            piano_roll_3d[instrument, pitch, start_step:end_step] = velocity_normalized
 
     return piano_roll_3d

@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+from constants import METADATA_PATH
 
 
 def get_path(root: str, index: str) -> str:
@@ -21,7 +22,7 @@ def get_path(root: str, index: str) -> str:
 
 def iterate_dataset(root: str):
     """Creates a iterator that yields the absolute path of each file in the dataset."""
-    df = pd.read_csv(os.path.join("E:/giant-midi-archive/mapping.csv"), sep='\t')
+    df = pd.read_csv(os.path.join(METADATA_PATH, "mapping.csv"), sep='\t')
     for index in df['index']:
         try:
             yield get_path(root, index)

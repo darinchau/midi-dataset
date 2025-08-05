@@ -1,3 +1,6 @@
+# This code is part of a script to convert MIDI files to MusicXML format using a web service.
+# Said web https://github.com/darinchau/midi2xml
+
 import os
 import requests
 from concurrent.futures import ProcessPoolExecutor, as_completed
