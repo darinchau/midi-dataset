@@ -1,6 +1,6 @@
 # This script stores all the scripts that have been used to analyse metadata and label MIDI files in the Giant MIDI Archive.
 # And maybe in the process exports a few useful ones
-# raw_data_path = "E
+# The functions might not run because the paths might not be correct.
 import pandas as pd
 import os
 import json
@@ -29,7 +29,7 @@ def create_aria_labels(root: str, df: pd.DataFrame):
     print(f"Creating aria labels for {len(df)} files...")
 
     json_path = "E:/data/raw-midi-data/data/data/v2/aria-midi-v1-ext/aria-midi-v1-ext/metadata.json"
-    with open(os.path.join(json_path, "/v2/aria-midi-v1-ext/aria-midi-v1-ext/metadata.json"), 'r') as f:
+    with open(json_path, 'r') as f:
         metadata = json.load(f)
     df['aria_midi_number'] = df['original_path'].apply(lambda x: os.path.basename(x).split("_")[0] if "aria-midi-v1-ext" in x else "")
 
