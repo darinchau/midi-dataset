@@ -229,7 +229,7 @@ def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
     return notes_data
 
 
-def get_instrument_name(midi_program):
+def get_instrument_name(midi_program: int):
     """
     Get the General MIDI instrument name from program number.
     """

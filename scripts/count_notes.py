@@ -1,9 +1,9 @@
 import os
 from functools import partial
 from multiprocessing import Pool, cpu_count
-from util import iterate_dataset
-from constants import *
-from analyse import parse_musicxml
+from src.util import iterate_dataset
+from src.constants import *
+from src.analyse import parse_musicxml
 import numpy as np
 import traceback
 from tqdm.auto import tqdm

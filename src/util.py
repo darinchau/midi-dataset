@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from constants import METADATA_PATH
+from .constants import METADATA_PATH
 
 
 def get_path(root: str, index: str) -> str:
