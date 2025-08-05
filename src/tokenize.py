@@ -3,13 +3,14 @@ import numpy as np
 from .analyse import *
 import numpy as np
 import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import Element
 from dataclasses import dataclass
 from .util import get_inv_time_signature_map
 
 BARLINE = object()
 
 
-def get_text_or_raise(elem) -> str:
+def get_text_or_raise(elem: Element[str] | None) -> str:
     """
     Get text from an XML element, raise ValueError if not found.
     """
@@ -90,7 +91,7 @@ def musicxml_to_tokens(xml_path: str, debug=True):
     # Find tempo and divisions
     for element in root.iter():
         if element.tag == 'divisions':
-            divisions = int(element.text)
+            divisions = int(get_text_or_raise(element))
             if debug:
                 print(f"Divisions per quarter note: {divisions}")
         elif element.tag == 'sound' and 'tempo' in element.attrib:
@@ -117,11 +118,11 @@ def musicxml_to_tokens(xml_path: str, debug=True):
         for score_part in root.findall('.//score-part[@id="{}"]'.format(part_id)):
             midi_instr = score_part.find('.//midi-instrument/midi-program')
             if midi_instr is not None:
-                current_instrument = int(midi_instr.text) - 1  # MIDI programs are 1-indexed in MusicXML
+                current_instrument = int(get_text_or_raise(midi_instr)) - 1  # MIDI programs are 1-indexed in MusicXML
                 if debug:
                     # Also try to get instrument name
                     part_name = score_part.find('.//part-name')
-                    instr_name = part_name.text if part_name is not None else "Unknown"
+                    instr_name = get_text_or_raise(part_name) if part_name is not None else "Unknown"
                     print(f"  Instrument: {instr_name} (MIDI Program: {current_instrument})")
 
         current_time = 0
@@ -138,8 +139,10 @@ def musicxml_to_tokens(xml_path: str, debug=True):
             for attributes in measure.findall('.//attributes'):
                 time_elem = attributes.find('time')
                 if time_elem is not None:
-                    beats = time_elem.find('beats').text
-                    beat_type = time_elem.find('beat-type').text
+                    beats_elem = time_elem.find('beats')
+                    beat_type_elem = time_elem.find('beat-type')
+                    beats = get_text_or_raise(beats_elem)
+                    beat_type = get_text_or_raise(beat_type_elem)
                     current_time_signature = f"{beats}/{beat_type}"
                     if debug:
                         print(f"    Time signature: {current_time_signature}")
@@ -158,25 +161,28 @@ def musicxml_to_tokens(xml_path: str, debug=True):
                     pitch_elem = element.find('pitch')
                     if pitch_elem is not None:
                         # Get pitch components
-                        step = pitch_elem.find('step').text
+                        step_elem = pitch_elem.find('step')
+                        step = get_text_or_raise(step_elem)
                         assert step in {'C', 'D', 'E', 'F', 'G', 'A', 'B'}, f"Invalid step: {step}"
 
-                        octave = int(pitch_elem.find('octave').text)
+                        octave_elem = pitch_elem.find('octave')
+                        octave = int(get_text_or_raise(octave_elem))
                         alter_elem = pitch_elem.find('alter')
-                        alter = int(alter_elem.text) if alter_elem is not None else 0
+                        alter = int(get_text_or_raise(alter_elem)) if alter_elem is not None else 0
 
                         # Convert to MIDI note number
                         note_map = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
                         midi_note = 12 * (octave + 1) + note_map[step] + alter
 
                         # Get duration
-                        duration_ticks = int(element.find('duration').text)
+                        duration_elem = element.find('duration')
+                        duration_ticks = int(get_text_or_raise(duration_elem))
 
                         # Get velocity - first check for explicit velocity element
                         velocity = current_dynamics
                         velocity_elem = element.find('velocity')
                         if velocity_elem is not None:
-                            velocity = int(velocity_elem.text)
+                            velocity = int(get_text_or_raise(velocity_elem))
                         else:
                             # Check for dynamics in notations
                             notations = element.find('notations')
@@ -204,23 +210,27 @@ def musicxml_to_tokens(xml_path: str, debug=True):
 
                     # Update time if not a chord
                     if element.find('chord') is None and element.find('duration') is not None:
-                        duration = int(element.find('duration').text)
+                        duration_elem = element.find('duration')
+                        duration = int(get_text_or_raise(duration_elem))
                         current_time += duration
 
                 elif element.tag == 'backup':
-                    duration = int(element.find('duration').text)
+                    duration_elem = element.find('duration')
+                    duration = int(get_text_or_raise(duration_elem))
                     current_time -= duration
                     if debug:
                         print(f"    Backup: {duration} ticks")
 
                 elif element.tag == 'forward':
-                    duration = int(element.find('duration').text)
+                    duration_elem = element.find('duration')
+                    duration = int(get_text_or_raise(duration_elem))
                     current_time += duration
                     if debug:
                         print(f"    Forward: {duration} ticks")
 
                 elif element.tag == 'rest':
-                    duration = int(element.find('duration').text)
+                    duration_elem = element.find('duration')
+                    duration = int(get_text_or_raise(duration_elem))
                     current_time += duration
                     if debug:
                         duration_seconds = (duration / divisions * 60.0) / tempo_bpm
@@ -247,4 +257,7 @@ def musicxml_to_tokens(xml_path: str, debug=True):
             print(f"Time signatures used: {sorted(time_signatures_used)}")
         print("="*80 + "\n")
 
+    # Convert notes_data to numpy array
+    notes_data = [element_to_nparray(n) for n in notes_data]
+    notes_data = np.stack(notes_data)
     return notes_data
