@@ -43,13 +43,11 @@ class MusicXMLNote:
             raise ValueError(f"Invalid pitch: {self.pitch}")
         if self.start < 0 or self.duration < 0:
             raise ValueError("Start and duration must be non-negative")
-        if not (0 <= self.index < 42):
-            raise ValueError(f"Invalid line of fifths index: {self.index}")
-        if not (0 <= self.octave < 10):
-            raise ValueError(f"Invalid octave: {self.octave}")
         if not (0 <= self.velocity <= 127):
             raise ValueError(f"Invalid velocity: {self.velocity}")
-        # TODO check if pitch/octave are consistent with MIDI pitch number
+        calculated_pitch = 12 * (self.octave + 1) + ([0, 7, 2, 9, 4, 11, 5][self.index % 7] + (self.index + 1) // 7)
+        if calculated_pitch != self.pitch:
+            raise ValueError(f"Pitch {self.pitch} does not match calculated pitch {calculated_pitch} from index {self.index}")
 
 
 def _step_alter_to_lof_index(step: str, alter: int) -> int:
