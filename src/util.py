@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 from functools import cache
+from xml.etree.ElementTree import Element
 from .constants import METADATA_PATH
 
 
@@ -200,3 +201,26 @@ def get_inv_time_signature_map():
 @cache
 def get_inv_gm_instruments_map():
     return {v: k for k, v in get_gm_instruments_map().items()}
+
+
+def get_text_or_raise(elem: Element[str] | None) -> str:
+    """
+    Get text from an XML element, raise ValueError if not found.
+    """
+    if elem is None or elem.text is None:
+        raise ValueError("Element text is None")
+    return elem.text
+
+
+def dynamics_to_velocity(dynamics_tag: str) -> int:
+    """
+    Convert musical dynamics notation to MIDI velocity.
+    """
+    dynamics_map = {
+        'pppp': 8, 'ppp': 20, 'pp': 33, 'p': 45,
+        'mp': 60, 'mf': 75, 'f': 88, 'ff': 103,
+        'fff': 117, 'ffff': 127,
+        'sf': 100, 'sfz': 100, 'sffz': 115,
+        'fp': 88, 'rfz': 100, 'rf': 100
+    }
+    return dynamics_map.get(dynamics_tag, 80)  # Default to mezzo-forte

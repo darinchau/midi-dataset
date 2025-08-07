@@ -1,22 +1,13 @@
+# Extracts sparse compound word tokens from MusicXML files.
+
 import os
-import numpy as np
-from .analyse import *
 import numpy as np
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import Element
 from dataclasses import dataclass
-from .util import get_inv_time_signature_map
+from ..util import get_inv_time_signature_map,  get_text_or_raise, dynamics_to_velocity
 
 BARLINE = object()
-
-
-def get_text_or_raise(elem: Element[str] | None) -> str:
-    """
-    Get text from an XML element, raise ValueError if not found.
-    """
-    if elem is None or elem.text is None:
-        raise ValueError("Element text is None")
-    return elem.text
 
 
 def check_element(element):

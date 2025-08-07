@@ -1,8 +1,9 @@
+# Extracts and analyzes MusicXML files to create a 3D piano roll representation.
 import numpy as np
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import List
-import music21
+from ..util import get_text_or_raise, get_inv_gm_instruments_map, dynamics_to_velocity
 
 
 @dataclass(frozen=True)
@@ -16,15 +17,6 @@ class MusicXMLNote:
     velocity: int  # MIDI velocity (0-127)
 
 
-def get_text_or_raise(elem) -> str:
-    """
-    Get text from an XML element, raise ValueError if not found.
-    """
-    if elem is None or elem.text is None:
-        raise ValueError("Element text is None")
-    return elem.text
-
-
 def _step_alter_to_lof_index(step: str, alter: int) -> int:
     assert step in {"C", "D", "E", "F", "G", "A", "B"}, f"Invalid step: {step}"
     return {"C": 0, "D": 2, "E": 4, "F": -1, "G": 1, "A": 3, "B": 5}[step] + 7 * alter
@@ -35,20 +27,6 @@ def _lof_index_to_step_alter(index: int) -> tuple[str, int]:
     step = ("C", "G", "D", "A", "E", "B", "F")[idx]
     alter = (index + 1) // 7
     return step, alter
-
-
-def dynamics_to_velocity(dynamics_tag: str) -> int:
-    """
-    Convert musical dynamics notation to MIDI velocity.
-    """
-    dynamics_map = {
-        'pppp': 8, 'ppp': 20, 'pp': 33, 'p': 45,
-        'mp': 60, 'mf': 75, 'f': 88, 'ff': 103,
-        'fff': 117, 'ffff': 127,
-        'sf': 100, 'sfz': 100, 'sffz': 115,
-        'fp': 88, 'rfz': 100, 'rf': 100
-    }
-    return dynamics_map.get(dynamics_tag, 80)  # Default to mezzo-forte
 
 
 def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
