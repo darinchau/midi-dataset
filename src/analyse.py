@@ -16,6 +16,15 @@ class MusicXMLNote:
     velocity: int  # MIDI velocity (0-127)
 
 
+def get_text_or_raise(elem) -> str:
+    """
+    Get text from an XML element, raise ValueError if not found.
+    """
+    if elem is None or elem.text is None:
+        raise ValueError("Element text is None")
+    return elem.text
+
+
 def _step_alter_to_lof_index(step: str, alter: int) -> int:
     assert step in {"C", "D", "E", "F", "G", "A", "B"}, f"Invalid step: {step}"
     return {"C": 0, "D": 2, "E": 4, "F": -1, "G": 1, "A": 3, "B": 5}[step] + 7 * alter
@@ -65,7 +74,7 @@ def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
     # Find tempo and divisions
     for element in root.iter():
         if element.tag == 'divisions':
-            divisions = int(element.text)
+            divisions = int(get_text_or_raise(element))
             if debug:
                 print(f"Divisions per quarter note: {divisions}")
         elif element.tag == 'sound' and 'tempo' in element.attrib:
@@ -93,11 +102,11 @@ def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
         for score_part in root.findall('.//score-part[@id="{}"]'.format(part_id)):
             midi_instr = score_part.find('.//midi-instrument/midi-program')
             if midi_instr is not None:
-                current_instrument = int(midi_instr.text) - 1  # MIDI programs are 1-indexed in MusicXML
+                current_instrument = int(get_text_or_raise(midi_instr)) - 1  # MIDI programs are 1-indexed in MusicXML
                 if debug:
                     # Also try to get instrument name
                     part_name = score_part.find('.//part-name')
-                    instr_name = part_name.text if part_name is not None else "Unknown"
+                    instr_name = get_text_or_raise(part_name) if part_name is not None else "Unknown"
                     print(f"  Instrument: {instr_name} (MIDI Program: {current_instrument})")
 
         current_time = 0
@@ -122,25 +131,28 @@ def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
                     pitch_elem = element.find('pitch')
                     if pitch_elem is not None:
                         # Get pitch components
-                        step = pitch_elem.find('step').text
+                        step_elem = pitch_elem.find('step')
+                        step = get_text_or_raise(step_elem)
                         assert step in {'C', 'D', 'E', 'F', 'G', 'A', 'B'}, f"Invalid step: {step}"
 
-                        octave = int(pitch_elem.find('octave').text)
+                        octave_elem = pitch_elem.find('octave')
+                        octave = int(get_text_or_raise(octave_elem))
                         alter_elem = pitch_elem.find('alter')
-                        alter = int(alter_elem.text) if alter_elem is not None else 0
+                        alter = int(get_text_or_raise(alter_elem)) if alter_elem is not None else 0
 
                         # Convert to MIDI note number
                         note_map = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
                         midi_note = 12 * (octave + 1) + note_map[step] + alter
 
                         # Get duration
-                        duration_ticks = int(element.find('duration').text)
+                        duration_elem = element.find('duration')
+                        duration_ticks = int(get_text_or_raise(duration_elem))
 
                         # Get velocity - first check for explicit velocity element
                         velocity = current_dynamics
                         velocity_elem = element.find('velocity')
                         if velocity_elem is not None:
-                            velocity = int(velocity_elem.text)
+                            velocity = int(get_text_or_raise(velocity_elem))
                         else:
                             # Check for dynamics in notations
                             notations = element.find('notations')
@@ -176,7 +188,7 @@ def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
                             # Additional info if available
                             voice = element.find('voice')
                             if voice is not None:
-                                print(f"      - Voice: {voice.text}")
+                                print(f"      - Voice: {get_text_or_raise(voice)}")
 
                         notes_data.append(MusicXMLNote(
                             instrument=current_instrument,
@@ -190,23 +202,27 @@ def parse_musicxml(xml_path: str, debug=True) -> List[MusicXMLNote]:
 
                     # Update time if not a chord
                     if element.find('chord') is None and element.find('duration') is not None:
-                        duration = int(element.find('duration').text)
+                        duration_elem = element.find('duration')
+                        duration = int(get_text_or_raise(duration_elem))
                         current_time += duration
 
                 elif element.tag == 'backup':
-                    duration = int(element.find('duration').text)
+                    duration_elem = element.find('duration')
+                    duration = int(get_text_or_raise(duration_elem))
                     current_time -= duration
                     if debug:
                         print(f"    Backup: {duration} ticks")
 
                 elif element.tag == 'forward':
-                    duration = int(element.find('duration').text)
+                    duration_elem = element.find('duration')
+                    duration = int(get_text_or_raise(duration_elem))
                     current_time += duration
                     if debug:
                         print(f"    Forward: {duration} ticks")
 
                 elif element.tag == 'rest':
-                    duration = int(element.find('duration').text)
+                    duration_elem = element.find('duration')
+                    duration = int(get_text_or_raise(duration_elem))
                     current_time += duration
                     if debug:
                         duration_seconds = (duration / divisions * 60.0) / tempo_bpm
