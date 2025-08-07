@@ -203,7 +203,7 @@ def get_inv_gm_instruments_map():
     return {v: k for k, v in get_gm_instruments_map().items()}
 
 
-def get_text_or_raise(elem: Element[str] | None) -> str:
+def get_text_or_raise(elem: Element | None) -> str:
     """
     Get text from an XML element, raise ValueError if not found.
     """
