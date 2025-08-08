@@ -62,7 +62,7 @@ def _lof_index_to_step_alter(index: int) -> tuple[str, int]:
     return step, alter
 
 
-def musicxml_to_tokens(xml_path: str, debug=True):
+def parse_musicxml(xml_path: str, debug=True):
     """
     Tokenize a list of MusicXMLNote objects into a one-hot encoded 3D piano roll.
 
@@ -346,3 +346,20 @@ def notes_data_to_piano_roll(notes_data: list[MusicXMLNote], steps_per_second=24
                 break
 
     return piano_roll_3d, metadata_array
+
+
+def is_valid_xml(xml_path: str) -> bool:
+    """
+    Check if the given file is a valid MusicXML file. Should be used as a filter for dataset iteration.
+
+    Args:
+        xml_path (str): Path to the MusicXML file.
+
+    Returns:
+        bool: True if the file is a valid MusicXML file, False otherwise.
+    """
+    try:
+        notes = parse_musicxml(xml_path, debug=False)
+        return len(notes) > 0
+    except ET.ParseError:
+        return False

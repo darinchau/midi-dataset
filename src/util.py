@@ -2,7 +2,7 @@ import os
 import pandas as pd
 from functools import cache
 from xml.etree.ElementTree import Element
-from .constants import METADATA_PATH
+from .constants import METADATA_PATH, MIDI_ROOT, XML_ROOT
 
 
 def get_path(root: str, index: str) -> str:
@@ -31,6 +31,26 @@ def iterate_dataset(root: str):
         except FileNotFoundError as e:
             print(f"File not found for index {index}: {e}")
             continue
+
+
+def iterate_midis():
+    return iterate_dataset(MIDI_ROOT)
+
+
+def iterate_xmls(check: bool = True):
+    """Iterate through all XML files in the dataset.
+    If `check` is True, it will validate each XML file using `is_valid_xml`.
+    """
+    from .extract.analyze import is_valid_xml
+    for path in iterate_dataset(XML_ROOT):
+        if check:
+            if is_valid_xml(path):
+                yield path
+            else:
+                print(f"Invalid XML file: {path}")
+                continue
+        else:
+            yield path
 
 
 @cache
