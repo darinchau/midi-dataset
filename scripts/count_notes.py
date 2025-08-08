@@ -146,6 +146,6 @@ if __name__ == "__main__":
     # Use 16 workers as requested
     counts = main_parallel(n_workers=16, chunk_size=10)
 
-    # Save the final counts
-    np.save('note_counts.npy', counts)
-    print("\nSaved counts to 'note_counts.npy'")
+    # Save the final counts as npz
+    np.savez_compressed("./resources/note_counts.npz", counts)
+    print("\nSaved counts to 'note_counts.npz'")
