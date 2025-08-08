@@ -10,7 +10,7 @@ from ..util import get_text_or_raise, get_inv_gm_instruments_map, dynamics_to_ve
 class MusicXMLNote:
     instrument: int
     pitch: int  # MIDI pitch number (0-127)
-    start: float  # seconds
+    start: float  # seconds from beginning of the piece
     duration: float  # seconds
     start_ql: float  # quarter notes from start of the bar
     duration_ql: float  # quarter notes length
@@ -21,11 +21,11 @@ class MusicXMLNote:
     barline: bool  # True if this note is not a note but a barline
 
     @classmethod
-    def get_barline(cls):
+    def get_barline(cls, current_time: float):
         return cls(
             instrument=0,
             pitch=0,
-            start=0.0,
+            start=current_time,
             duration=0.0,
             start_ql=0.0,
             duration_ql=0.0,
@@ -252,7 +252,8 @@ def parse_musicxml(xml_path: str, debug=True):
                         print(f"    Rest: {duration_seconds:.3f} seconds")
 
             # Insert BARLINE after each measure
-            notes_data.append(MusicXMLNote.get_barline())
+            start_seconds = (current_time / divisions * 60.0) / tempo_bpm
+            notes_data.append(MusicXMLNote.get_barline(start_seconds))
 
     if debug:
         print("\n" + "="*80)
@@ -317,13 +318,14 @@ def fix_time_signature(notes_data: List[MusicXMLNote]) -> List[MusicXMLNote]:
 
     for note in notes_data:
         new_timesig = note.timesig
-        if new_timesig not in mapping:
+        if not note.barline and new_timesig not in mapping.values():
+            print(f"Fixing time signature for note: {new_timesig}")
             if new_timesig in fixes:
                 new_timesig = fixes[new_timesig]
             else:
                 new_timesig = "UNK"
-        assert new_timesig in mapping.values(), f"Invalid time signature: {new_timesig}"
-        # This in place modification is explitly stated in the docstring
-        object.__setattr__(note, 'timesig', new_timesig)
+            assert new_timesig in mapping.values(), f"Invalid time signature: {new_timesig}"
+            # This in place modification is explitly stated in the docstring
+            object.__setattr__(note, 'timesig', new_timesig)
 
     return notes_data

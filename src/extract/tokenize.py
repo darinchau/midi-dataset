@@ -66,7 +66,7 @@ def musicxml_to_pianoroll(notes_data: list[MusicXMLNote], steps_per_second=24):
         return np.zeros((128, 128, 1), dtype=np.float32), np.zeros((16, 1), dtype=np.float32)
 
     max_time = max(n.start + n.duration for n in actual_notes)
-    total_steps = int(np.ceil(max_time * steps_per_second))
+    total_steps = int(np.ceil(max_time * steps_per_second)) + 1
 
     # Initialize arrays
     piano_roll_3d = np.zeros((128, 128, total_steps), dtype=np.float32)
@@ -79,11 +79,9 @@ def musicxml_to_pianoroll(notes_data: list[MusicXMLNote], steps_per_second=24):
     # First pass: collect barline times and process notes
     for i, note in enumerate(notes_data):
         if note.barline:
-            # Find the time of the next non-barline note
-            for j in range(i + 1, len(notes_data)):
-                if not notes_data[j].barline:
-                    barline_times.append(notes_data[j].start)
-                    break
+            barline_times.append(note.start)
+            current_time_sig_index = 0
+            continue
         else:
             # Process regular notes for piano roll
             instrument = max(0, min(127, note.instrument))
@@ -117,11 +115,10 @@ def musicxml_to_pianoroll(notes_data: list[MusicXMLNote], steps_per_second=24):
         if 0 <= current_time_sig_index < 15:
             metadata_array[current_time_sig_index, t] = 1.0
 
-        # Check if this is the first position after a barline (position 15)
-        for barline_time in barline_times:
-            barline_step = int(barline_time * steps_per_second)
-            if t == barline_step:
-                metadata_array[15, t] = 1.0
-                break
+    # Fill in the barline positions
+    for barline_time in barline_times:
+        barline_step = int(barline_time * steps_per_second)
+        if barline_step < total_steps:
+            metadata_array[15, barline_step] = 1.0
 
     return piano_roll_3d, metadata_array
