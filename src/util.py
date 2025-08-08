@@ -209,7 +209,7 @@ def get_time_signature_map():
         12: "6/4",
         13: "7/4",
         14: "5/8",
-        15: "unused"
+        15: None  # unused for now
     }
 
 

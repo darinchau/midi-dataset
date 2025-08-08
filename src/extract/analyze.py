@@ -322,7 +322,7 @@ def fix_time_signature(notes_data: List[MusicXMLNote]) -> List[MusicXMLNote]:
                 new_timesig = fixes[new_timesig]
             else:
                 new_timesig = "UNK"
-            assert new_timesig in mapping, f"Invalid time signature: {new_timesig}"
+        assert new_timesig in mapping.values() and new_timesig is not None, f"Invalid time signature: {new_timesig}"
         # This in place modification is explitly stated in the docstring
         object.__setattr__(note, 'timesig', new_timesig)
 
