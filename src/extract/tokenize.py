@@ -5,7 +5,7 @@ import numpy as np
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import Element
 from dataclasses import dataclass
-from .roll import MusicXMLNote, musicxml_to_tokens as parse_musicxml
+from .analyze import MusicXMLNote, musicxml_to_tokens as parse_musicxml
 from ..util import get_inv_time_signature_map,  get_text_or_raise, dynamics_to_velocity
 
 

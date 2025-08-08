@@ -4,7 +4,7 @@ from multiprocessing import Pool, cpu_count
 from src.util import iterate_dataset
 from src.constants import *
 from src.util import get_time_signature_map
-from src.extract.roll import musicxml_to_tokens as parse_musicxml
+from src.extract.analyze import musicxml_to_tokens as parse_musicxml
 import numpy as np
 import traceback
 from tqdm.auto import tqdm
