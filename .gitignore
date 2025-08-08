@@ -72,16 +72,10 @@ nohup.out
 # VS code
 .vscode
 
-/resources/*
+# /resources/*
 *.ipynb
 
 scripts/playlist_queue.txt
-!/resources/ckpts
-!/resources/ckpts/*
-!/resources/config
-!/resources/config/*
-!/resources/archive
-!/resources/archive/*
 !cleanup.ipynb
 # uploaded files for google cloud
 uploaded_files.txt
