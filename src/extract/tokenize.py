@@ -53,11 +53,11 @@ def musicxml_to_tokens(notes_data: list[MusicXMLNote]):
     return x
 
 
-def notes_data_to_piano_roll(notes_data: list[MusicXMLNote], steps_per_second=24):
+def musicxml_to_pianoroll(notes_data: list[MusicXMLNote], steps_per_second=24):
     # Get time signature mapping
     time_sig_map = get_time_signature_map()
     # Create reverse mapping from time signature string to index
-    time_sig_to_index = {v: k for k, v in time_sig_map.items() if k < 12}
+    time_sig_to_index = {v: k for k, v in time_sig_map.items() if k < 15}
 
     # Calculate total time steps
     # Filter out barlines when calculating max time
@@ -113,8 +113,8 @@ def notes_data_to_piano_roll(notes_data: list[MusicXMLNote], steps_per_second=24
                 current_time_sig_index = time_sig_to_index[note.timesig]
             note_idx += 1
 
-        # Set time signature one-hot encoding (positions 0-11)
-        if 0 <= current_time_sig_index < 12:
+        # Set time signature one-hot encoding (positions 0-14)
+        if 0 <= current_time_sig_index < 15:
             metadata_array[current_time_sig_index, t] = 1.0
 
         # Check if this is the first position after a barline (position 15)
