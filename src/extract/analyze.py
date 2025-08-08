@@ -274,80 +274,6 @@ def parse_musicxml(xml_path: str, debug=True):
     return notes_data
 
 
-def notes_data_to_piano_roll(notes_data: list[MusicXMLNote], steps_per_second=24):
-    # Get time signature mapping
-    time_sig_map = get_time_signature_map()
-    # Create reverse mapping from time signature string to index
-    time_sig_to_index = {v: k for k, v in time_sig_map.items() if k < 12}
-
-    # Calculate total time steps
-    # Filter out barlines when calculating max time
-    actual_notes = [n for n in notes_data if not n.barline]
-    if not actual_notes:
-        return np.zeros((128, 128, 1), dtype=np.float32), np.zeros((16, 1), dtype=np.float32)
-
-    max_time = max(n.start + n.duration for n in actual_notes)
-    total_steps = int(np.ceil(max_time * steps_per_second))
-
-    # Initialize arrays
-    piano_roll_3d = np.zeros((128, 128, total_steps), dtype=np.float32)
-    metadata_array = np.zeros((16, total_steps), dtype=np.float32)
-
-    # Track current time signature and barline positions
-    current_time_sig_index = 0  # Default to "UNK"
-    barline_times = []
-
-    # First pass: collect barline times and process notes
-    for i, note in enumerate(notes_data):
-        if note.barline:
-            # Find the time of the next non-barline note
-            for j in range(i + 1, len(notes_data)):
-                if not notes_data[j].barline:
-                    barline_times.append(notes_data[j].start)
-                    break
-        else:
-            # Process regular notes for piano roll
-            instrument = max(0, min(127, note.instrument))
-            pitch = max(0, min(127, note.pitch))
-            start_step = int(note.start * steps_per_second)
-            end_step = int((note.start + note.duration) * steps_per_second)
-
-            # Convert MIDI velocity (0-127) to 0-1 range
-            velocity_normalized = note.velocity / 127.0
-
-            if start_step < total_steps:
-                end_step = min(end_step, total_steps)
-                piano_roll_3d[instrument, pitch, start_step:end_step] = velocity_normalized
-
-    # Second pass: fill metadata array
-    # Sort notes by start time (excluding barlines)
-    sorted_notes = sorted([n for n in notes_data if not n.barline], key=lambda x: x.start)
-    note_idx = 0
-
-    for t in range(total_steps):
-        current_time = t / steps_per_second
-
-        # Update current time signature based on notes at or before this time
-        while note_idx < len(sorted_notes) and sorted_notes[note_idx].start <= current_time:
-            note = sorted_notes[note_idx]
-            if note.timesig in time_sig_to_index:
-                current_time_sig_index = time_sig_to_index[note.timesig]
-            note_idx += 1
-
-        # Set time signature one-hot encoding (positions 0-11)
-        if 0 <= current_time_sig_index < 12:
-            metadata_array[current_time_sig_index, t] = 1.0
-
-        # Check if this is the first position after a barline (position 15)
-        for barline_time in barline_times:
-            barline_step = int(barline_time * steps_per_second)
-            if t == barline_step:
-                metadata_array[15, t] = 1.0
-                break
-
-    return piano_roll_3d, metadata_array
-
-
 def is_valid_xml(xml_path: str) -> bool:
     """
     Check if the given file is a valid MusicXML file. Should be used as a filter for dataset iteration.
@@ -363,3 +289,41 @@ def is_valid_xml(xml_path: str) -> bool:
         return len(notes) > 0
     except ET.ParseError:
         return False
+
+
+def fix_time_signature(notes_data: List[MusicXMLNote]) -> List[MusicXMLNote]:
+    """
+    Fix time signature for each note in the notes_data list.
+    If a note has no time signature, set it to "UNK".
+    Modifies the notes_data in place and returns the original list with updated note objects
+
+    Args:
+        notes_data (List[MusicXMLNote]): List of MusicXMLNote objects.
+
+    Returns:
+        List[MusicXMLNote]: Updated list with fixed time signatures.
+    """
+    mapping = get_time_signature_map()
+
+    fixes = {
+        "2/2": "4/4",
+        "4/2": "4/4",
+        "3/2": "6/4",
+        "8/4": "4/4",
+        "8/8": "4/4",
+        "4/8": "2/4",
+        "16/16": "4/4",
+    }
+
+    for note in notes_data:
+        new_timesig = note.timesig
+        if new_timesig not in mapping:
+            if new_timesig in fixes:
+                new_timesig = fixes[new_timesig]
+            else:
+                new_timesig = "UNK"
+            assert new_timesig in mapping, f"Invalid time signature: {new_timesig}"
+        # This in place modification is explitly stated in the docstring
+        object.__setattr__(note, 'timesig', new_timesig)
+
+    return notes_data
