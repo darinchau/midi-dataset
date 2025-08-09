@@ -1,9 +1,12 @@
 # Extracts and analyzes MusicXML files to create a 3D piano roll representation.
 import numpy as np
 import xml.etree.ElementTree as ET
+import logging
 from dataclasses import dataclass
 from typing import List
 from ..util import get_text_or_raise, get_inv_gm_instruments_map, dynamics_to_velocity, get_time_signature_map
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -62,13 +65,12 @@ def _lof_index_to_step_alter(index: int) -> tuple[str, int]:
     return step, alter
 
 
-def parse_musicxml(xml_path: str, verbose=True):
+def parse_musicxml(xml_path: str):
     """
     Tokenize a list of MusicXMLNote objects into a one-hot encoded 3D piano roll.
 
     Args:
         xml_path (str): Path to the MusicXML file.
-        verbose (bool): If True, prints verbose information.
 
     Returns:
         np.ndarray: A (T, d) 2D array where T is the number of time steps and d is the number of dimensions
@@ -94,39 +96,31 @@ def parse_musicxml(xml_path: str, verbose=True):
     for element in root.iter():
         if element.tag == 'divisions':
             divisions = int(get_text_or_raise(element))
-            if verbose:
-                print(f"Divisions per quarter note: {divisions}")
+            logger.debug(f"Divisions per quarter note: {divisions}")
         elif element.tag == 'sound' and 'tempo' in element.attrib:
             tempo_bpm = float(element.attrib['tempo'])
-            if verbose:
-                print(f"Tempo: {tempo_bpm} BPM")
+            logger.debug(f"Tempo: {tempo_bpm} BPM")
 
     # Collect all notes with their timing and instrument info
     notes_data: list[MusicXMLNote] = []
     current_time = 0
     current_instrument = 0
 
-    if verbose:
-        print("\n" + "="*80)
-        print("PARSING NOTES:")
-        print("="*80)
+    logger.info("Starting to parse notes")
 
     for part in root.findall('.//part'):
         part_id = part.get('id')
-
-        if verbose:
-            print(f"\nProcessing Part: {part_id}")
+        logger.debug(f"Processing Part: {part_id}")
 
         # Try to find instrument for this part
         for score_part in root.findall('.//score-part[@id="{}"]'.format(part_id)):
             midi_instr = score_part.find('.//midi-instrument/midi-program')
             if midi_instr is not None:
                 current_instrument = int(get_text_or_raise(midi_instr)) - 1  # MIDI programs are 1-indexed in MusicXML
-                if verbose:
-                    # Also try to get instrument name
-                    part_name = score_part.find('.//part-name')
-                    instr_name = get_text_or_raise(part_name) if part_name is not None else "Unknown"
-                    print(f"  Instrument: {instr_name} (MIDI Program: {current_instrument})")
+                # Also try to get instrument name
+                part_name = score_part.find('.//part-name')
+                instr_name = get_text_or_raise(part_name) if part_name is not None else "Unknown"
+                logger.debug(f"  Instrument: {instr_name} (MIDI Program: {current_instrument})")
 
         current_time = 0
         measure_number = 0
@@ -135,8 +129,8 @@ def parse_musicxml(xml_path: str, verbose=True):
             measure_number += 1
             measure_start_time = current_time  # Track start of measure
 
-            if verbose and measure.get('number'):
-                print(f"\n  Measure {measure.get('number')}:")
+            if measure.get('number'):
+                logger.debug(f"  Measure {measure.get('number')}:")
 
             # Check for time signature changes
             for attributes in measure.findall('.//attributes'):
@@ -147,8 +141,7 @@ def parse_musicxml(xml_path: str, verbose=True):
                     beats = get_text_or_raise(beats_elem)
                     beat_type = get_text_or_raise(beat_type_elem)
                     current_time_signature = f"{beats}/{beat_type}"
-                    if verbose:
-                        print(f"    Time signature: {current_time_signature}")
+                    logger.debug(f"    Time signature: {current_time_signature}")
 
             # Check for dynamics changes in this measure
             for direction in measure.findall('.//direction'):
@@ -156,8 +149,7 @@ def parse_musicxml(xml_path: str, verbose=True):
                 if dynamics is not None:
                     for dyn in dynamics:
                         current_dynamics = dynamics_to_velocity(dyn.tag)
-                        if verbose:
-                            print(f"    Dynamics change: {dyn.tag} (velocity: {current_dynamics})")
+                        logger.debug(f"    Dynamics change: {dyn.tag} (velocity: {current_dynamics})")
 
             for element in measure:
                 if element.tag == 'note':
@@ -233,44 +225,37 @@ def parse_musicxml(xml_path: str, verbose=True):
                     duration_elem = element.find('duration')
                     duration = int(get_text_or_raise(duration_elem))
                     current_time -= duration
-                    if verbose:
-                        print(f"    Backup: {duration} ticks")
+                    logger.debug(f"    Backup: {duration} ticks")
 
                 elif element.tag == 'forward':
                     duration_elem = element.find('duration')
                     duration = int(get_text_or_raise(duration_elem))
                     current_time += duration
-                    if verbose:
-                        print(f"    Forward: {duration} ticks")
+                    logger.debug(f"    Forward: {duration} ticks")
 
                 elif element.tag == 'rest':
                     duration_elem = element.find('duration')
                     duration = int(get_text_or_raise(duration_elem))
                     current_time += duration
-                    if verbose:
-                        duration_seconds = (duration / divisions * 60.0) / tempo_bpm
-                        print(f"    Rest: {duration_seconds:.3f} seconds")
+                    duration_seconds = (duration / divisions * 60.0) / tempo_bpm
+                    logger.debug(f"    Rest: {duration_seconds:.3f} seconds")
 
             # Insert BARLINE after each measure
             start_seconds = (current_time / divisions * 60.0) / tempo_bpm
             notes_data.append(MusicXMLNote.get_barline(start_seconds))
 
-    if verbose:
-        print("\n" + "="*80)
-        print(f"SUMMARY:")
-        # Count actual notes (excluding barlines)
-        actual_notes = [n for n in notes_data if not n.barline]
-        print(f"Total notes parsed: {len(actual_notes)}")
-        print(f"Total barlines: {sum(1 for n in notes_data if n.barline)}")
-        if actual_notes:
-            print(f"Time range: 0.000 - {max(n.start + n.duration for n in actual_notes):.3f} seconds")
-            instruments_used = set(n.instrument for n in actual_notes)
-            print(f"Instruments used: {sorted(instruments_used)}")
-            pitch_range = [min(n.pitch for n in actual_notes), max(n.pitch for n in actual_notes)]
-            print(f"Pitch range: MIDI {pitch_range[0]} - {pitch_range[1]}")
-            velocity_range = [min(n.velocity for n in actual_notes), max(n.velocity for n in actual_notes)]
-            print(f"Velocity range: {velocity_range[0]} - {velocity_range[1]}")
-        print("="*80 + "\n")
+    # Count actual notes (excluding barlines)
+    actual_notes = [n for n in notes_data if not n.barline]
+    logger.info(f"Total notes parsed: {len(actual_notes)}")
+    logger.info(f"Total barlines: {sum(1 for n in notes_data if n.barline)}")
+    if actual_notes:
+        logger.info(f"Time range: 0.000 - {max(n.start + n.duration for n in actual_notes):.3f} seconds")
+        instruments_used = set(n.instrument for n in actual_notes)
+        logger.info(f"Instruments used: {sorted(instruments_used)}")
+        pitch_range = [min(n.pitch for n in actual_notes), max(n.pitch for n in actual_notes)]
+        logger.info(f"Pitch range: MIDI {pitch_range[0]} - {pitch_range[1]}")
+        velocity_range = [min(n.velocity for n in actual_notes), max(n.velocity for n in actual_notes)]
+        logger.info(f"Velocity range: {velocity_range[0]} - {velocity_range[1]}")
 
     return notes_data
 
@@ -286,13 +271,13 @@ def is_valid_xml(xml_path: str) -> bool:
         bool: True if the file is a valid MusicXML file, False otherwise.
     """
     try:
-        notes = parse_musicxml(xml_path, verbose=False)
+        notes = parse_musicxml(xml_path)
         return len(notes) > 0
     except ET.ParseError:
         return False
 
 
-def fix_time_signature(notes_data: List[MusicXMLNote], verbose: bool = True) -> List[MusicXMLNote]:
+def fix_time_signature(notes_data: List[MusicXMLNote]) -> List[MusicXMLNote]:
     """
     Fix time signature for each note in the notes_data list.
     If a note has no time signature, set it to "UNK".
@@ -319,7 +304,7 @@ def fix_time_signature(notes_data: List[MusicXMLNote], verbose: bool = True) -> 
     for note in notes_data:
         new_timesig = note.timesig
         if not note.barline and new_timesig not in mapping.values():
-            print(f"Fixing time signature for note: {new_timesig}")
+            logger.debug(f"Fixing time signature for note: {new_timesig}")
             if new_timesig in fixes:
                 new_timesig = fixes[new_timesig]
             else:
@@ -331,19 +316,18 @@ def fix_time_signature(notes_data: List[MusicXMLNote], verbose: bool = True) -> 
     return notes_data
 
 
-def musicxml_to_notes(xml_path: str, verbose=True) -> List[MusicXMLNote]:
+def musicxml_to_notes(xml_path: str) -> List[MusicXMLNote]:
     """
     Parse a MusicXML file and return a list of MusicXMLNote objects.
 
     Args:
         xml_path (str): Path to the MusicXML file.
-        verbose (bool): If True, prints verbose information.
 
     Returns:
         List[MusicXMLNote]: List of MusicXMLNote objects parsed from the file.
     """
-    notes = parse_musicxml(xml_path, verbose=verbose)
-    notes = fix_time_signature(notes, verbose=verbose)
+    notes = parse_musicxml(xml_path)
+    notes = fix_time_signature(notes)
     notes = sorted(notes, key=lambda n: (n.start, not n.barline, n.instrument, n.pitch))
     # Remove duplicate barlines
     current_barline = None
