@@ -48,6 +48,7 @@ def musicxml_to_tokens(notes_data: list[MusicXMLNote]):
         - Current time signature (16x, one-hot encoded)
         - Bar line? (0 or 1)
     """
+    x = sorted(notes_data, key=lambda n: n.start)
     x = [element_to_nparray(n) for n in notes_data]
     x = np.stack(x)
     return x
