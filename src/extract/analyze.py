@@ -24,7 +24,7 @@ class MusicXMLNote:
     barline: bool  # True if this note is not a note but a barline
 
     @classmethod
-    def get_barline(cls, current_time: float):
+    def get_barline(cls, current_time: float, current_timesig: str) -> 'MusicXMLNote':
         return cls(
             instrument=0,
             pitch=0,
@@ -35,7 +35,7 @@ class MusicXMLNote:
             index=0,
             octave=0,
             velocity=0,
-            timesig="",
+            timesig=current_timesig,
             barline=True
         )
 
@@ -242,7 +242,7 @@ def parse_musicxml(xml_path: str):
 
             # Insert BARLINE after each measure
             start_seconds = (current_time / divisions * 60.0) / tempo_bpm
-            notes_data.append(MusicXMLNote.get_barline(start_seconds))
+            notes_data.append(MusicXMLNote.get_barline(start_seconds, current_time_signature if current_time_signature else "UNK"))
 
     # Count actual notes (excluding barlines)
     actual_notes = [n for n in notes_data if not n.barline]
