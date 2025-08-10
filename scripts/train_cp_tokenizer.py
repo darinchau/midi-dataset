@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 from typing import Optional
 from functools import partial
 import pickle
+from accelerate import Accelerator
 
 from src.model.cp_tokenizer import ReformerCompressor, ModelConfig
 from src.extract import musicxml_to_notes
@@ -45,6 +46,8 @@ class DataConfig:
     drop_last: bool = False
     input_dim: int = 275
     padding_value: float = 0.0
+    gradient_accumulation_steps: int = 1
+    chunk_length: int = 256
 
 
 @dataclass(frozen=True)
@@ -74,15 +77,15 @@ class TrainingConfig:
     log_every_n_steps: int = 50
     val_every_n_epochs: int = 1
     use_wandb: bool = True
-    wandb_project: str = "reformer-compression-1"
+    wandb_project: str = "reformer-compression"
 
     # Early stopping
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 1e-4
 
-    # Device
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    mixed_precision: bool = True
+    # Device - removed as Accelerate handles this
+    # device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    mixed_precision: str = "fp16"  # Changed to string for accelerate: "no", "fp16", "bf16"
 
     # Resume training
     resume_from_checkpoint: Optional[str] = None
@@ -136,27 +139,47 @@ class TokenDataset(Dataset):
 
 def collate_fn(
     batch: List[Dict[str, Union[torch.Tensor, int]]],
-    padding_value: float = 0.0
+    padding_value: float = 0.0,
+    chunk_length: int = 256
 ) -> Dict[str, torch.Tensor]:
     """
     Custom collate function to handle variable-length sequences
+    Pads sequences to the nearest multiple of chunk_length
 
     Args:
         batch: List of dictionaries from dataset
         padding_value: Value to use for padding
+        chunk_length: Pad sequences to multiples of this value
 
     Returns:
         Dictionary containing:
-            - input: Padded sequences (batch_size, max_seq_len, input_dim)
-            - attention_mask: Binary mask (batch_size, max_seq_len)
+            - input: Padded sequences (batch_size, padded_seq_len, input_dim)
+            - attention_mask: Binary mask (batch_size, padded_seq_len)
             - lengths: Original sequence lengths (batch_size,)
     """
     # Extract inputs and lengths
     inputs: list[torch.Tensor] = [item['input'] for item in batch]  # type: ignore
     lengths = torch.LongTensor([item['length'] for item in batch])
 
-    # Pad sequences
-    padded_inputs = pad_sequence(inputs, batch_first=True, padding_value=padding_value)
+    # Find max length and pad to nearest multiple of chunk_length
+    max_length = max(len(inp) for inp in inputs)
+    padded_length = ((max_length + chunk_length - 1) // chunk_length) * chunk_length
+
+    # Pad sequences to the padded_length
+    padded_inputs = []
+    for inp in inputs:
+        if len(inp) < padded_length:
+            padding = torch.full(
+                (padded_length - len(inp), inp.shape[1]),
+                padding_value,
+                dtype=inp.dtype
+            )
+            padded_inp = torch.cat([inp, padding], dim=0)
+        else:
+            padded_inp = inp[:padded_length]
+        padded_inputs.append(padded_inp)
+
+    padded_inputs = torch.stack(padded_inputs, dim=0)
 
     # Create attention mask
     batch_size, max_seq_len = padded_inputs.shape[:2]
@@ -258,7 +281,11 @@ def create_dataloader(
     else:
         shuffle = config.shuffle and is_training
 
-    collate = partial(collate_fn, padding_value=config.padding_value)
+    collate = partial(
+        collate_fn,
+        padding_value=config.padding_value,
+        chunk_length=config.chunk_length
+    )
 
     # Create dataloader
     dataloader = DataLoader(
@@ -282,21 +309,19 @@ class TokenDataModule:
     def __init__(
         self,
         config: DataConfig,
-        train_split: float,
-        val_split: float,
-        test_split: float,
-        random_seed: int
+        n_val: int = 1000,
+        n_test: int = 1000,
+        random_seed: int = 42,
     ):
-        assert abs(train_split + val_split + test_split - 1.0) < 1e-6
-
         self.config = config
         self.files = get_all_xml_paths()
 
         # Split files into train/val/test
         n_files = len(self.files)
-        n_train = int(n_files * train_split)
-        n_val = int(n_files * val_split)
-        n_test = n_files - n_train - n_val
+        n_train = n_files - n_test - n_val
+
+        if n_train <= 0 or n_val <= 0 or n_test <= 0:
+            raise ValueError(f"Not enough files to create train/val/test splits. Ensure you have at least {n_val + n_test + 1} files.")
 
         # Set random seed for reproducible splits
         torch.manual_seed(random_seed)
@@ -425,8 +450,9 @@ class CompressionLoss(nn.Module):
 class ModelCheckpoint:
     """Handle model checkpointing"""
 
-    def __init__(self, config: TrainingConfig):
+    def __init__(self, config: TrainingConfig, accelerator: Accelerator):
         self.config = config
+        self.accelerator = accelerator
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.best_val_loss = float('inf')
@@ -443,38 +469,41 @@ class ModelCheckpoint:
         data_config: DataConfig
     ) -> None:
         """Save model checkpoint"""
-        checkpoint = {
-            'epoch': epoch,
-            'step': step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'val_loss': val_loss,
-            'model_config': model_config,
-            'data_config': data_config,
-            'training_config': self.config,
-        }
+        # Only save on main process
+        if self.accelerator.is_main_process:
+            checkpoint = {
+                'epoch': epoch,
+                'step': step,
+                'model_state_dict': self.accelerator.unwrap_model(model).state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'val_loss': val_loss,
+                'model_config': model_config,
+                'data_config': data_config,
+                'training_config': self.config,
+            }
 
-        # Save latest checkpoint
-        checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{epoch}.pt'
-        torch.save(checkpoint, checkpoint_path)
+            # Save latest checkpoint
+            checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{epoch}.pt'
+            self.accelerator.save(checkpoint, checkpoint_path)
 
-        # Save best checkpoint
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            best_path = self.checkpoint_dir / 'best_model.pt'
-            torch.save(checkpoint, best_path)
-            logging.info(f"New best model saved with val_loss: {val_loss:.4f}")
+            # Save best checkpoint
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                best_path = self.checkpoint_dir / 'best_model.pt'
+                self.accelerator.save(checkpoint, best_path)
+                logging.info(f"New best model saved with val_loss: {val_loss:.4f}")
 
-        # Clean up old checkpoints
-        self._cleanup_old_checkpoints(epoch)
+            # Clean up old checkpoints
+            self._cleanup_old_checkpoints(epoch)
 
     def _cleanup_old_checkpoints(self, current_epoch: int) -> None:
         """Keep only the last N checkpoints"""
-        checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
-        if len(checkpoints) > self.config.keep_last_n_checkpoints:
-            for ckpt in checkpoints[:-self.config.keep_last_n_checkpoints]:
-                ckpt.unlink()
+        if self.accelerator.is_main_process:
+            checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
+            if len(checkpoints) > self.config.keep_last_n_checkpoints:
+                for ckpt in checkpoints[:-self.config.keep_last_n_checkpoints]:
+                    ckpt.unlink()
 
     def load_checkpoint(
         self,
@@ -509,7 +538,15 @@ class Trainer:
         data_config: DataConfig,
         training_config: TrainingConfig
     ):
-        self.model = model.to(training_config.device)
+        # Initialize accelerator
+        self.accelerator = Accelerator(
+            mixed_precision=training_config.mixed_precision,
+            gradient_accumulation_steps=data_config.gradient_accumulation_steps,
+            log_with="wandb" if training_config.use_wandb else None,
+            project_dir=training_config.checkpoint_dir
+        )
+
+        self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.model_config = model_config
@@ -529,11 +566,16 @@ class Trainer:
         # Setup scheduler
         self.scheduler = self._create_scheduler()
 
-        # Setup checkpointing
-        self.checkpoint_manager = ModelCheckpoint(training_config)
+        # Prepare with accelerator
+        self.model, self.optimizer, self.train_loader, self.val_loader = self.accelerator.prepare(
+            self.model, self.optimizer, self.train_loader, self.val_loader
+        )
 
-        # Setup mixed precision
-        self.scaler = torch.cuda.amp.GradScaler() if training_config.mixed_precision else None
+        if self.scheduler is not None:
+            self.scheduler = self.accelerator.prepare(self.scheduler)
+
+        # Setup checkpointing
+        self.checkpoint_manager = ModelCheckpoint(training_config, self.accelerator)
 
         # Setup logging
         self._setup_logging()
@@ -560,29 +602,28 @@ class Trainer:
             return OneCycleLR(
                 self.optimizer,
                 max_lr=self.config.learning_rate,
-                total_steps=len(self.train_loader) * self.config.max_epochs,
+                total_steps=len(self.train_loader) * self.config.max_epochs // self.data_config.gradient_accumulation_steps,
                 pct_start=0.1
             )
         return None
 
     def _setup_logging(self) -> None:
         """Setup logging"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
-
-        if self.config.use_wandb:
-            wandb.login(key=os.environ.get('WANDB_API_KEY') or "EMPTY")
-            wandb.init(
-                project=self.config.wandb_project,
-                config={
-                    'model_config': self.model_config.__dict__,
-                    'data_config': self.data_config.__dict__,
-                    'training_config': self.config.__dict__
-                }
+        if self.accelerator.is_main_process:
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(levelname)s - %(message)s'
             )
-            wandb.watch(self.model, log_freq=100)
+
+            if self.config.use_wandb:
+                self.accelerator.init_trackers(
+                    project_name=self.config.wandb_project,
+                    config={
+                        'model_config': self.model_config.__dict__,
+                        'data_config': self.data_config.__dict__,
+                        'training_config': self.config.__dict__
+                    }
+                )
 
     def _resume_from_checkpoint(self, checkpoint_path: str) -> None:
         """Resume training from checkpoint"""
@@ -601,17 +642,17 @@ class Trainer:
 
         progress_bar = tqdm(
             self.train_loader,
-            desc=f"Epoch {self.current_epoch}/{self.config.max_epochs}"
+            desc=f"Epoch {self.current_epoch}/{self.config.max_epochs}",
+            disable=not self.accelerator.is_local_main_process
         )
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Move to device
-            inputs = batch['input'].to(self.config.device)
-            attention_mask = batch['attention_mask'].to(self.config.device)
+            # Move to device is handled by accelerator
+            inputs = batch['input']
+            attention_mask = batch['attention_mask']
 
-            # Mixed precision training
-            with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
-                # Forward pass
+            # Forward pass
+            with self.accelerator.accumulate(self.model):
                 reconstructed, indices, vq_loss = self.model(inputs)
 
                 # Compute loss
@@ -619,27 +660,28 @@ class Trainer:
                     reconstructed, inputs, vq_loss, attention_mask
                 )
 
-            # Backward pass
-            self.optimizer.zero_grad()
+                # Scale loss by gradient accumulation steps
+                loss = loss / self.data_config.gradient_accumulation_steps
 
-            if self.scaler:
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.gradient_clip_val
-                )
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.gradient_clip_val
-                )
+                # Backward pass
+                self.accelerator.backward(loss)
+
+                # Gradient clipping
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.gradient_clip_val
+                    )
+
+                # Optimizer step (only when gradients are synced)
                 self.optimizer.step()
 
-            # Update scheduler
-            if self.scheduler and self.config.scheduler_type == "onecycle":
-                self.scheduler.step()
+                # Update scheduler for OneCycle
+                if self.scheduler and self.config.scheduler_type == "onecycle":
+                    self.scheduler.step()
+
+                # Zero gradients
+                self.optimizer.zero_grad()
 
             # Logging
             epoch_losses.append(loss_dict['loss/total'])
@@ -655,8 +697,8 @@ class Trainer:
                 )
 
                 # Log to wandb
-                if self.config.use_wandb:
-                    wandb.log(loss_dict, step=self.global_step)
+                if self.config.use_wandb and self.accelerator.is_main_process:
+                    self.accelerator.log(loss_dict, step=self.global_step)
 
             self.global_step += 1
 
@@ -672,12 +714,16 @@ class Trainer:
         self.model.eval()
         val_losses = []
 
-        progress_bar = tqdm(self.val_loader, desc="Validation")
+        progress_bar = tqdm(
+            self.val_loader,
+            desc="Validation",
+            disable=not self.accelerator.is_local_main_process
+        )
 
         for batch in progress_bar:
-            # Move to device
-            inputs = batch['input'].to(self.config.device)
-            attention_mask = batch['attention_mask'].to(self.config.device)
+            # Move to device is handled by accelerator
+            inputs = batch['input']
+            attention_mask = batch['attention_mask']
 
             # Forward pass
             reconstructed, indices, vq_loss = self.model(inputs)
@@ -687,46 +733,54 @@ class Trainer:
                 reconstructed, inputs, vq_loss, attention_mask
             )
 
-            val_losses.append(loss_dict['loss/total'])
+            # Gather losses across devices
+            gathered_loss: torch.Tensor = self.accelerator.gather(loss)  # type: ignore
+
+            if self.accelerator.is_main_process:
+                val_losses.extend(gathered_loss.cpu().numpy())
+
             progress_bar.set_postfix(loss=loss_dict['loss/total'])
 
-        avg_val_loss = np.mean(val_losses)
+        avg_val_loss = np.mean(val_losses).item() if val_losses else float('inf')
 
         # Log validation metrics
-        if self.config.use_wandb:
-            wandb.log({
+        if self.config.use_wandb and self.accelerator.is_main_process:
+            self.accelerator.log({
                 'val/loss': avg_val_loss,
                 'epoch': self.current_epoch
             }, step=self.global_step)
 
-        return {'val_loss': avg_val_loss.item()}
+        return {'val_loss': avg_val_loss}
 
     def train(self) -> None:
         """Main training loop"""
-        logging.info("Starting training...")
+        if self.accelerator.is_main_process:
+            logging.info("Starting training...")
 
         for epoch in range(self.current_epoch, self.config.max_epochs):
             self.current_epoch = epoch
 
             # Train epoch
             train_metrics = self.train_epoch()
-            logging.info(f"Epoch {epoch} - Train loss: {train_metrics['train_loss']:.4f}")
+            if self.accelerator.is_main_process:
+                logging.info(f"Epoch {epoch} - Train loss: {train_metrics['train_loss']:.4f}")
 
             # Validate
             if epoch % self.config.val_every_n_epochs == 0:
                 val_metrics = self.validate()
-                logging.info(f"Epoch {epoch} - Val loss: {val_metrics['val_loss']:.4f}")
+                if self.accelerator.is_main_process:
+                    logging.info(f"Epoch {epoch} - Val loss: {val_metrics['val_loss']:.4f}")
 
-                # Early stopping
-                if val_metrics['val_loss'] < self.best_val_loss - self.config.early_stopping_min_delta:
-                    self.best_val_loss = val_metrics['val_loss']
-                    self.patience_counter = 0
-                else:
-                    self.patience_counter += 1
+                    # Early stopping
+                    if val_metrics['val_loss'] < self.best_val_loss - self.config.early_stopping_min_delta:
+                        self.best_val_loss = val_metrics['val_loss']
+                        self.patience_counter = 0
+                    else:
+                        self.patience_counter += 1
 
-                if self.patience_counter >= self.config.early_stopping_patience:
-                    logging.info(f"Early stopping triggered after {epoch + 1} epochs")
-                    break
+                    if self.patience_counter >= self.config.early_stopping_patience:
+                        logging.info(f"Early stopping triggered after {epoch + 1} epochs")
+                        break
 
                 # Save checkpoint
                 if epoch % self.config.save_every_n_epochs == 0:
@@ -736,17 +790,17 @@ class Trainer:
                         self.model_config, self.data_config
                     )
 
-        logging.info("Training completed!")
+        if self.accelerator.is_main_process:
+            logging.info("Training completed!")
 
-        # Save final model
-        self.checkpoint_manager.save_checkpoint(
-            self.model, self.optimizer, self.scheduler,
-            self.current_epoch, self.global_step, self.best_val_loss,
-            self.model_config, self.data_config
-        )
+            # Save final model
+            self.checkpoint_manager.save_checkpoint(
+                self.model, self.optimizer, self.scheduler,
+                self.current_epoch, self.global_step, self.best_val_loss,
+                self.model_config, self.data_config
+            )
 
-        if self.config.use_wandb:
-            wandb.finish()
+        self.accelerator.end_training()
 
 
 def load_musicxml_tokens(file_path: str) -> np.ndarray:
@@ -760,6 +814,34 @@ def load_musicxml_tokens(file_path: str) -> np.ndarray:
         logging.error(f"Error loading {file_path}: {e}")
         # Return empty array on error
         return np.array([]).reshape(0, 275)
+
+
+def test_model(trainer: Trainer, data_module: TokenDataModule) -> None:
+    # Test the model after training
+    if not trainer.accelerator.is_main_process:
+        return
+    logging.info("Testing final model...")
+    test_loader = data_module.test_dataloader()
+    test_loader = trainer.accelerator.prepare(test_loader)
+    test_metrics = trainer.validate()  # Use same validation logic for test
+    logging.info(f"Test loss: {test_metrics['val_loss']:.4f}")
+
+    # Calculate and log compression statistics
+    trainer.model.eval()
+    with torch.no_grad():
+        sample_batch = next(iter(test_loader))
+        inputs = sample_batch['input']
+
+        # Get compressed representation
+        compressed, indices = trainer.model.get_compressed_representation(inputs)
+
+        # Log compression statistics
+        original_size = inputs.numel() * 4  # float32 = 4 bytes
+        compressed_size = indices.numel() * 2  # int16 indices = 2 bytes
+        actual_ratio = original_size / compressed_size
+
+    logging.info(f"Theoretical compression ratio: {trainer.model.compress_ratio():.2f}x")
+    logging.info(f"Actual compression ratio: {actual_ratio:.2f}x")
 
 
 def main():
@@ -778,9 +860,11 @@ def main():
     )
 
     data_config = DataConfig(
-        batch_size=16,
+        batch_size=8,
         num_workers=4,
-        input_dim=275
+        gradient_accumulation_steps=4,
+        input_dim=model_config.total_input_dim,
+        chunk_length=model_config.lsh_attn_chunk_length
     )
 
     training_config = TrainingConfig(
@@ -788,18 +872,18 @@ def main():
         max_epochs=100,
         checkpoint_dir="./checkpoints/reformer_compression",
         use_wandb=True,
-        wandb_project="music-compression",
+        wandb_project="music-compression-1",
         early_stopping_patience=15,
         val_every_n_epochs=1,
-        save_every_n_epochs=5
+        save_every_n_epochs=5,
+        mixed_precision="bf16"
     )
 
     # Create data module
     data_module = TokenDataModule(
         config=data_config,
-        train_split=0.98,
-        val_split=0.01,
-        test_split=0.01,
+        n_val=1000,
+        n_test=1000,
         random_seed=1943
     )
 
@@ -822,29 +906,6 @@ def main():
 
     # Start training
     trainer.train()
-
-    # Test the model after training
-    logging.info("Testing final model...")
-    test_loader = data_module.test_dataloader()
-    test_metrics = trainer.validate()  # Use same validation logic for test
-    logging.info(f"Test loss: {test_metrics['val_loss']:.4f}")
-
-    # Calculate and log compression statistics
-    model.eval()
-    with torch.no_grad():
-        sample_batch = next(iter(test_loader))
-        inputs = sample_batch['input'].to(training_config.device)
-
-        # Get compressed representation
-        compressed, indices = model.get_compressed_representation(inputs)
-
-        # Log compression statistics
-        original_size = inputs.numel() * 4  # float32 = 4 bytes
-        compressed_size = indices.numel() * 2  # int16 indices = 2 bytes
-        actual_ratio = original_size / compressed_size
-
-        logging.info(f"Theoretical compression ratio: {model.compress_ratio():.2f}x")
-        logging.info(f"Actual compression ratio: {actual_ratio:.2f}x")
 
 
 if __name__ == "__main__":

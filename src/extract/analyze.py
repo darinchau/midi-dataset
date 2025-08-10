@@ -26,7 +26,7 @@ class MusicXMLNote:
     @classmethod
     def get_barline(cls, current_time: float, current_timesig: str) -> 'MusicXMLNote':
         return cls(
-            instrument=0,
+            instrument=-1,
             pitch=0,
             start=current_time,
             duration=0.0,

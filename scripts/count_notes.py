@@ -36,6 +36,8 @@ def process_single_file(file_path):
     try:
         notes_data = parse_musicxml(file_path)
         for note in notes_data:
+            if not note.barline:
+                continue
             instrument = min(max(0, note.instrument), 127)  # Ensure within bounds
             pitch = min(max(0, note.pitch), 127)
             velocity = min(max(0, note.velocity), 127)
