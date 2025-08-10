@@ -27,13 +27,13 @@ def main():
             continue
 
 
-def process_single_file(file_path, debug=False):
+def process_single_file(file_path):
     """
     Process a single MusicXML file and return time signature counts.
     """
     time_sigs = []
     try:
-        notes_data = parse_musicxml(file_path, debug=debug)
+        notes_data = parse_musicxml(file_path)
         for note in notes_data:
             if not note.barline and note.timesig:  # Skip barlines and notes without timesig
                 time_sigs.append(note.timesig)
@@ -77,7 +77,7 @@ def main_parallel(n_workers=16, chunk_size=10):
     # Process files in parallel with progress bar
     with Pool(processes=n_workers) as pool:
         # Use imap for better memory efficiency and progress tracking
-        process_func = partial(process_single_file, debug=False)
+        process_func = process_single_file
 
         # Progress bar with more detailed information
         with tqdm(total=total_files,

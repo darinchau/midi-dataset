@@ -27,14 +27,14 @@ def main():
             continue
 
 
-def process_single_file(file_path, debug=False):
+def process_single_file(file_path):
     """
     Process a single MusicXML file and return counts.
     Returns a sparse representation of counts to save memory.
     """
     counts_sparse = []
     try:
-        notes_data = parse_musicxml(file_path, debug=debug)
+        notes_data = parse_musicxml(file_path)
         for note in notes_data:
             instrument = min(max(0, note.instrument), 127)  # Ensure within bounds
             pitch = min(max(0, note.pitch), 127)
@@ -79,7 +79,7 @@ def main_parallel(n_workers=16, chunk_size=10):
     # Process files in parallel with progress bar
     with Pool(processes=n_workers) as pool:
         # Use imap for better memory efficiency and progress tracking
-        process_func = partial(process_single_file, debug=False)
+        process_func = process_single_file
 
         # Progress bar with more detailed information
         with tqdm(total=total_files,

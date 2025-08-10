@@ -14,19 +14,19 @@ def element_to_nparray(element: MusicXMLNote):
     """
     Convert a music xml token or a barline to a 1D vector
     """
-    v = np.zeros((128 + 128 + 1 + 1 + 1 + 16 + 1,))
+    v = np.zeros((128 + 128 + 16 + 1 + 1 + 1,))
     if element.barline:
-        v[-1] = 1
+        v[128 + 128 + 15] = 1
         return v
     time_sig_idx = get_inv_time_signature_map().get(element.timesig, 0)
     v[element.instrument] = 1
     v[128 + element.pitch] = 1
+    v[128 + 128 + time_sig_idx] = 1
     # This should be the velocity field but we found that the parsed xml only uses 80 for the velocity
+    # save this as the velocity field
     v[128 + 128] = 1
-    v[128 + 128 + 1] = element.start_ql
-    v[128 + 128 + 1 + 1] = element.duration_ql
-    v[128 + 128 + 1 + 1 + 1 + time_sig_idx] = 1
-    v[-1] = 0
+    v[-2] = element.start_ql
+    v[-1] = element.duration_ql
     return v
 
 
@@ -35,18 +35,17 @@ def musicxml_to_tokens(notes_data: list[MusicXMLNote]):
     Tokenize a list of MusicXMLNote objects into a one-hot encoded 3D piano roll.
 
     Args:
-        xml_path (str): Path to the MusicXML file.
+        notes_data (list[MusicXMLNote]): A list of MusicXMLNote objects representing the notes in the piece.
 
     Returns:
         np.ndarray: A (T, d) 2D array where T is the number of time steps and d is the number of dimensions
         The dimesions are:
         - Instrument (128x, one-hot encoded)
         - Pitch (128x, one-hot encoded)
+        - Current time signature (16x, one-hot encoded)
         - Velocity (0-1)
         - Onset (# Quarter notes from start of the bar)
         - Duration (# Quarter notes)
-        - Current time signature (16x, one-hot encoded)
-        - Bar line? (0 or 1)
     """
     x = sorted(notes_data, key=lambda n: n.start)
     x = [element_to_nparray(n) for n in notes_data]
@@ -55,6 +54,24 @@ def musicxml_to_tokens(notes_data: list[MusicXMLNote]):
 
 
 def musicxml_to_pianoroll(notes_data: list[MusicXMLNote], steps_per_second=24):
+    """
+    Convert a list of MusicXMLNote objects into a 3D piano roll representation and a metadata array.
+
+    Args:
+        notes_data (list[MusicXMLNote]): A list of MusicXMLNote objects representing the notes in the piece.
+        steps_per_second (int): The number of time steps per second for the piano roll.
+    Returns:
+        tuple: A tuple containing:
+        - piano_roll_3d (np.ndarray): A 3D numpy array of shape (128, 128, T) representing the piano roll.
+            Dimensions are:
+            - Instrument (128x, one-hot encoded)
+            - Pitch (128x, one-hot encoded)
+            - Time steps (T)
+        - metadata_array (np.ndarray): A 2D numpy array of shape (16, T) containing metadata.
+            Dimensions are:
+            - Time signature (15x, one-hot encoded for time signatures 0-14)
+            - Barline (1x, binary indicating barline presence)
+    """
     # Get time signature mapping
     time_sig_map = get_time_signature_map()
     # Create reverse mapping from time signature string to index

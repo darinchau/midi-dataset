@@ -88,3 +88,4 @@ data
 *.npy
 *.zip
 logs.txt
+resources/cache

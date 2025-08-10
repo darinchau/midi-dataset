@@ -3,6 +3,10 @@ import pandas as pd
 from functools import cache
 from xml.etree.ElementTree import Element
 from .constants import METADATA_PATH, MIDI_ROOT, XML_ROOT
+import pickle
+from tqdm.auto import tqdm
+
+CACHE_PATH = "./resources/cache"
 
 
 def get_path(root: str, index: str) -> str:
@@ -51,6 +55,23 @@ def iterate_xmls(check: bool = True):
                 continue
         else:
             yield path
+
+
+def get_all_xml_paths() -> list[str]:
+    """
+    Get all valid XML file paths in the dataset.
+    If the cache exists, it will load from there.
+    Otherwise, it will iterate through the dataset and create the cache, taking an absurd amount of time.
+    """
+    cache_file = os.path.join(CACHE_PATH, "valid_xmls_cp.pkl")
+    if os.path.exists(cache_file):
+        with open(cache_file, 'rb') as f:
+            files = pickle.load(f)
+    else:
+        files = list(tqdm(iterate_dataset(XML_ROOT), desc="Loading XML files"))
+        with open(cache_file, 'wb') as f:
+            pickle.dump(files, f)
+    return files
 
 
 @cache
