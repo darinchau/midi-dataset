@@ -21,6 +21,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from typing import Optional
+from functools import partial
 import pickle
 
 from src.model.cp_tokenizer import ReformerCompressor, ModelConfig
@@ -227,7 +228,7 @@ class ChunkedSampler(torch.utils.data.Sampler):
 
 
 def create_dataloader(
-    dataset: Dataset,
+    dataset: TokenDataset,
     config: DataConfig,
     is_training: bool = True,
     use_length_sampling: bool = True
@@ -257,6 +258,8 @@ def create_dataloader(
     else:
         shuffle = config.shuffle and is_training
 
+    collate = partial(collate_fn, padding_value=config.padding_value)
+
     # Create dataloader
     dataloader = DataLoader(
         dataset,
@@ -266,7 +269,7 @@ def create_dataloader(
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
         drop_last=config.drop_last if sampler is None else False,
-        collate_fn=lambda batch: collate_fn(batch, config.padding_value),
+        collate_fn=collate,
         persistent_workers=config.num_workers > 0
     )
 
@@ -289,33 +292,40 @@ class TokenDataModule:
         self.config = config
         self.files = get_all_xml_paths()
 
-        # Create full dataset to get file list
-        full_dataset = TokenDataset(self.files, config, is_training=True)
-
-        # Split files into train/val/test using PyTorch
-
-        # Calculate split sizes
-        n_files = len(full_dataset.files)
+        # Split files into train/val/test
+        n_files = len(self.files)
         n_train = int(n_files * train_split)
         n_val = int(n_files * val_split)
-        n_test = n_files - n_train - n_val  # Ensure all files are used
+        n_test = n_files - n_train - n_val
 
-        # Use PyTorch's random_split
-        generator = torch.Generator().manual_seed(random_seed)
-        train_dataset, val_dataset, test_dataset = random_split(
-            full_dataset,
-            [n_train, n_val, n_test],
-            generator=generator
-        )
+        # Set random seed for reproducible splits
+        torch.manual_seed(random_seed)
+
+        # Shuffle files and split
+        shuffled_files = self.files.copy()
+        torch.manual_seed(random_seed)
+        indices = torch.randperm(len(shuffled_files)).tolist()
+        shuffled_files = [shuffled_files[i] for i in indices]
+
+        train_files = shuffled_files[:n_train]
+        val_files = shuffled_files[n_train:n_train + n_val]
+        test_files = shuffled_files[n_train + n_val:]
+
+        # Create datasets
+        train_dataset = TokenDataset(train_files, config, is_training=True)
+        val_dataset = TokenDataset(val_files, config, is_training=False)
+        test_dataset = TokenDataset(test_files, config, is_training=False)
 
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.test_dataset = test_dataset
 
-    def train_dataloader(self, use_length_sampling: bool = True) -> DataLoader:
+    def train_dataloader(self) -> DataLoader:
         return create_dataloader(
-            self.train_dataset, self.config,
-            is_training=True, use_length_sampling=use_length_sampling
+            self.train_dataset,
+            self.config,
+            is_training=True,
+            use_length_sampling=False
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -759,7 +769,6 @@ def main():
         total_input_dim=275,
         discrete_dim=273,
         continuous_dim=2,
-        hidden_dim=512,
         compressed_dim=128,
         num_layers=6,
         num_quantizers=8,
@@ -798,7 +807,7 @@ def main():
     model = create_model(model_config)
 
     # Get dataloaders
-    train_loader = data_module.train_dataloader(use_length_sampling=True)
+    train_loader = data_module.train_dataloader()
     val_loader = data_module.val_dataloader()
 
     # Create trainer

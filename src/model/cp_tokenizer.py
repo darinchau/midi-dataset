@@ -19,7 +19,7 @@ class ModelConfig:
     continuous_dim: int = 2
 
     # Model architecture
-    hidden_dim: int = 512
+    hidden_dim: int = 256
     compressed_dim: int = 128
 
     # Reformer configuration
