@@ -40,6 +40,10 @@ class MusicXMLNote:
         )
 
     def __post_init__(self):
+        if self.barline:
+            if not self.duration == 0.0 and self.duration_ql == 0.0:
+                raise ValueError("Barline note should have zero duration and quarter length")
+            return  # No further validation needed for barlines
         if not (0 <= self.instrument < 128):
             raise ValueError(f"Invalid instrument: {self.instrument}")
         if not (0 <= self.pitch < 128):

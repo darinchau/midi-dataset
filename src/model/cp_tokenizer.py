@@ -1,381 +1,440 @@
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Tuple, List, Optional
+# Tokenizes MIDI compound words (cp) into discrete tokens
+# script trains the model
+# python -m src.model.cp_tokenizer
 
+
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+from torch.utils.data import Dataset
 import numpy as np
-from transformers import ReformerConfig, ReformerModel
-from einops import rearrange, repeat
+from dataclasses import dataclass
+import logging
+from functools import cache
+from tqdm import tqdm
+from ..extract import musicxml_to_notes
+from ..extract.tokenize import musicxml_to_tokens
 
 
-@dataclass
-class ModelConfig:
-    """Configuration for the Reformer-RVQ compression model"""
-    # Input dimensions
-    total_input_dim: int = 276
-    discrete_dim: int = 274
-    continuous_dim: int = 2
-
-    # Model architecture
-    hidden_dim: int = 256
-    compressed_dim: int = 128
-
-    # Reformer configuration
-    num_layers: int = 6
-    num_heads: int = 8
-    feed_forward_size: int = 2048
-    max_position_embeddings: int = 4096
-    axial_pos_shape: Tuple[int, int] = (64, 64)
-    num_buckets: int = 64
-    num_hashes: int = 4
-    lsh_attn_chunk_length: int = 256
-    local_attn_chunk_length: int = 128
-
-    # RVQ configuration
-    num_quantizers: int = 4
-    codebook_size: int = 512
-    commitment_weight: float = 0.25
-
-    # Mixed feature encoder configuration
-    vocab_size: int = 1000
-    num_embeddings: int = 8
-
-    def __post_init__(self) -> None:
-        assert self.total_input_dim == self.discrete_dim + self.continuous_dim, \
-            "total_input_dim must equal discrete_dim + continuous_dim"
+@dataclass(frozen=True)
+class CpConfig:
+    """
+    Configuration for CP tokenizer training.
+    """
+    input_dim: int = 512
 
 
-class ResidualVectorQuantizer(nn.Module):
-    """Residual Vector Quantization module for compression"""
+class VectorQuantizer(nn.Module):
+    """
+    Vector Quantization layer that maps continuous representations to discrete codes.
+    Supports both L2 distance and DCAE.
 
-    def __init__(self, config: ModelConfig) -> None:
+    https://arxiv.org/abs/2504.00496
+    """
+
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25,
+                 use_dcae=False, temperature=1.0):
         super().__init__()
-        self.num_quantizers: int = config.num_quantizers
-        self.codebook_size: int = config.codebook_size
-        self.dim: int = config.compressed_dim
-        self.commitment_weight: float = config.commitment_weight
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.commitment_cost = commitment_cost
+        self.use_dcae = use_dcae
+        self.temperature = temperature
 
-        # Initialize codebooks for each quantizer
-        self.codebooks: nn.ParameterList = nn.ParameterList([
-            nn.Parameter(torch.randn(self.codebook_size, self.dim) * 0.1)
-            for _ in range(self.num_quantizers)
-        ])
+        # Initialize codebook
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
 
-    def forward(
-        self,
-        x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: input tensor of shape (batch, seq_len, compressed_dim)
+        if use_dcae:
+            # Additional projections for cross-entropy based assignment
+            self.query_proj = nn.Linear(embedding_dim, embedding_dim)
+            self.key_proj = nn.Linear(embedding_dim, embedding_dim)
+            # Learnable temperature parameter
+            self.temperature_param = nn.Parameter(torch.ones(1) * temperature)
 
-        Returns:
-            quantized: quantized tensor of shape (batch, seq_len, compressed_dim)
-            indices: codebook indices of shape (batch, seq_len, num_quantizers)
-            commitment_loss: scalar tensor
-        """
-        batch, seq_len, dim = x.shape
+    def forward(self, inputs):
+        # inputs shape: (batch, sequence_length, embedding_dim)
+        batch_size, seq_len, _ = inputs.shape
 
-        residual: torch.Tensor = x
-        quantized: torch.Tensor = torch.zeros_like(x)
-        all_indices: List[torch.Tensor] = []
-        commitment_loss: torch.Tensor = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        # Flatten input
+        flat_input = inputs.view(-1, self.embedding_dim)
 
-        for i, codebook in enumerate(self.codebooks):
-            distances: torch.Tensor = torch.cdist(residual, codebook)
-            indices: torch.Tensor = distances.argmin(dim=-1)
-            all_indices.append(indices)
-            quantized_step: torch.Tensor = F.embedding(indices, codebook)
-            quantized = quantized + quantized_step
-            commitment_loss = commitment_loss + F.mse_loss(
-                quantized_step.detach(), residual
-            )
+        if self.use_dcae:
+            # Cross-entropy based assignment (similarity-based)
+            # Project inputs and codebook to query and key spaces
+            queries = self.query_proj(flat_input)  # (batch*seq, embedding_dim)
+            keys = self.key_proj(self.embedding.weight)  # (num_embeddings, embedding_dim)
 
-            # Update residual
-            residual = residual - quantized_step.detach()
+            # Compute similarity scores (dot product)
+            similarity_scores = torch.matmul(queries, keys.t()) / self.temperature_param
 
-        all_indices_stacked: torch.Tensor = torch.stack(all_indices, dim=-1)
+            # Get assignments using softmax (soft assignment during training)
+            attention_weights = F.softmax(similarity_scores, dim=-1)
 
-        # Straight-through estimator
-        quantized = x + (quantized - x).detach()
+            # For hard assignment (inference), get argmax
+            encoding_indices = torch.argmax(similarity_scores, dim=-1, keepdim=True)
 
-        return quantized, all_indices_stacked, commitment_loss * self.commitment_weight
+            # Create one-hot encodings for straight-through estimator
+            encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
+            encodings.scatter_(1, encoding_indices, 1)
+
+            # Soft quantization during training (for better gradients)
+            quantized_soft = torch.matmul(attention_weights, self.embedding.weight)
+            quantized_hard = torch.matmul(encodings, self.embedding.weight)
+
+            # Reshape back
+            quantized_soft = quantized_soft.view(batch_size, seq_len, self.embedding_dim)
+            quantized_hard = quantized_hard.view(batch_size, seq_len, self.embedding_dim)
+
+            # Compute losses
+            # Commitment loss: encourage input to be close to selected codebook entry
+            commitment_loss = F.mse_loss(quantized_hard.detach(), inputs)
+
+            # Codebook loss: encourage codebook to be close to input
+            codebook_loss = F.mse_loss(quantized_hard, inputs.detach())
+
+            # Entropy regularization (encourage diverse codebook usage)
+            avg_probs = torch.mean(attention_weights, dim=0)
+            entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
+            entropy_reg = -0.01 * entropy  # negative because we want to maximize entropy
+
+            loss = codebook_loss + self.commitment_cost * commitment_loss + entropy_reg
+
+            # Straight-through estimator with soft-to-hard transition
+            quantized = inputs + (quantized_hard - inputs).detach()
+
+            # Use attention weights for perplexity calculation
+            perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        else:
+            # Original L2 distance based assignment
+            distances = (torch.sum(flat_input**2, dim=1, keepdim=True)
+                         + torch.sum(self.embedding.weight**2, dim=1)
+                         - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
+
+            # Get nearest codebook entries
+            encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+            encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
+            encodings.scatter_(1, encoding_indices, 1)
+
+            # Quantize using codebook
+            quantized = torch.matmul(encodings, self.embedding.weight).view(batch_size, seq_len, self.embedding_dim)
+
+            # Compute losses
+            e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+            q_latent_loss = F.mse_loss(quantized, inputs.detach())
+            loss = q_latent_loss + self.commitment_cost * e_latent_loss
+
+            # Straight-through estimator
+            quantized = inputs + (quantized - inputs).detach()
+
+            # Perplexity for monitoring
+            avg_probs = torch.mean(encodings, dim=0)
+            perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        encoding_indices = encoding_indices.view(batch_size, seq_len)
+        return quantized, loss, perplexity, encoding_indices
 
 
-class MixedFeatureEncoder(nn.Module):
-    """Handles mixed discrete and continuous features"""
+class MultiHeadSelfAttention(nn.Module):
+    """
+    Multi-head self-attention module.
+    """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
-        self.discrete_dim: int = config.discrete_dim
-        self.continuous_dim: int = config.continuous_dim
-        self.hidden_dim: int = config.hidden_dim
-        self.vocab_size: int = config.vocab_size
-        self.num_embeddings: int = config.num_embeddings
+        assert d_model % n_heads == 0
 
-        # Multiple embedding tables for handling sparse discrete features
-        self.embeddings: nn.ModuleList = nn.ModuleList([
-            nn.Embedding(self.vocab_size, self.hidden_dim // self.num_embeddings)
-            for _ in range(self.num_embeddings)
-        ])
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
 
-        # Project discrete features to embedding indices
-        chunk_size: int = self.discrete_dim // self.num_embeddings
-        self.discrete_projections: nn.ModuleList = nn.ModuleList([
-            nn.Linear(
-                chunk_size if i < self.num_embeddings - 1
-                else self.discrete_dim - chunk_size * (self.num_embeddings - 1),
-                1
-            )
-            for i in range(self.num_embeddings)
-        ])
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        self.w_o = nn.Linear(d_model, d_model)
 
-        # Process continuous features
-        self.continuous_projection: nn.Sequential = nn.Sequential(
-            nn.Linear(self.continuous_dim, self.hidden_dim // 2),
-            nn.LayerNorm(self.hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim // 2, self.hidden_dim)
-        )
+        self.dropout = nn.Dropout(dropout)
 
-        # Combine discrete and continuous features
-        self.fusion: nn.Sequential = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.GELU()
-        )
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: input tensor of shape (batch, seq_len, total_input_dim)
+        # Linear transformations and split into heads
+        q = self.w_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.w_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.w_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
 
-        Returns:
-            output: encoded features of shape (batch, seq_len, hidden_dim)
-        """
-        batch, seq_len, _ = x.shape
+        # Attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
 
-        # Split discrete and continuous features
-        discrete_features: torch.Tensor = x[..., :self.discrete_dim]
-        continuous_features: torch.Tensor = x[..., self.discrete_dim:]
+        # Apply attention to values
+        context = torch.matmul(attn_weights, v)
 
-        # Process discrete features through multiple embeddings
-        discrete_embeds: List[torch.Tensor] = []
-        chunk_size: int = self.discrete_dim // self.num_embeddings
+        # Concatenate heads
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
 
-        for i, (embed, proj) in enumerate(zip(self.embeddings, self.discrete_projections)):  # type: ignore
-            embed: torch.nn.Embedding
-            proj: nn.Linear
-            # Get chunk of discrete features
-            start_idx: int = i * chunk_size
-            end_idx: int = (i + 1) * chunk_size if i < self.num_embeddings - 1 else self.discrete_dim
-            chunk: torch.Tensor = discrete_features[..., start_idx:end_idx]
-
-            # Project to indices (handling sparsity)
-            indices: torch.Tensor = proj(chunk).squeeze(-1)
-            indices = torch.clamp(indices, 0, embed.num_embeddings - 1).long()
-
-            # Get embeddings
-            embed_chunk: torch.Tensor = embed(indices)
-            discrete_embeds.append(embed_chunk)
-
-        # Concatenate all discrete embeddings
-        discrete_encoded: torch.Tensor = torch.cat(discrete_embeds, dim=-1)
-
-        # Process continuous features
-        continuous_encoded: torch.Tensor = self.continuous_projection(continuous_features)
-
-        # Combine features
-        combined: torch.Tensor = torch.cat([discrete_encoded, continuous_encoded], dim=-1)
-        output: torch.Tensor = self.fusion(combined)
+        # Final linear transformation
+        output = self.w_o(context)
 
         return output
 
 
-class ReformerCompressor(nn.Module):
-    """Main model combining Reformer and RVQ for sequence compression"""
+class TransformerBlock(nn.Module):
+    """
+    Transformer block with self-attention and feed-forward network.
+    """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1):
         super().__init__()
-        self.config: ModelConfig = config
+        if d_ff is None:
+            d_ff = 4 * d_model
 
-        # Feature encoder for mixed input
-        self.feature_encoder: MixedFeatureEncoder = MixedFeatureEncoder(config)
+        self.attention = MultiHeadSelfAttention(d_model, n_heads, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
 
-        # Reformer encoder configuration
-        self.encoder_config: ReformerConfig = ReformerConfig(
-            hidden_size=config.hidden_dim,
-            num_attention_heads=config.num_heads,
-            num_hidden_layers=config.num_layers,
-            feed_forward_size=config.feed_forward_size,
-            max_position_embeddings=config.max_position_embeddings,
-            axial_pos_shape=list(config.axial_pos_shape),
-            num_buckets=config.num_buckets,
-            num_hashes=config.num_hashes,
-            lsh_attn_chunk_length=config.lsh_attn_chunk_length,
-            local_attn_chunk_length=config.local_attn_chunk_length,
-            lsh_num_chunks_before=1,
-            lsh_num_chunks_after=1,
-            is_decoder=False
-        )
-
-        # Reformer encoder
-        self.encoder: ReformerModel = ReformerModel(self.encoder_config)
-
-        # Compression projection
-        self.compress_projection: nn.Linear = nn.Linear(
-            config.hidden_dim, config.compressed_dim
-        )
-
-        # RVQ module
-        self.rvq: ResidualVectorQuantizer = ResidualVectorQuantizer(config)
-
-        # Decoder projection
-        self.decompress_projection: nn.Linear = nn.Linear(
-            config.compressed_dim, config.hidden_dim
-        )
-
-        # Reformer decoder configuration
-        self.decoder_config: ReformerConfig = ReformerConfig(
-            hidden_size=config.hidden_dim,
-            num_attention_heads=config.num_heads,
-            num_hidden_layers=config.num_layers,
-            feed_forward_size=config.feed_forward_size,
-            max_position_embeddings=config.max_position_embeddings,
-            axial_pos_shape=list(config.axial_pos_shape),
-            num_buckets=config.num_buckets,
-            num_hashes=config.num_hashes,
-            lsh_attn_chunk_length=config.lsh_attn_chunk_length,
-            local_attn_chunk_length=config.local_attn_chunk_length,
-            is_decoder=True
-        )
-
-        # Reformer decoder
-        self.decoder: ReformerModel = ReformerModel(self.decoder_config)
-
-        # Output reconstruction layers
-        self.output_projection: nn.Linear = nn.Linear(
-            config.hidden_dim, config.hidden_dim
-        )
-
-        # Reconstruct discrete features
-        self.discrete_reconstruction: nn.Linear = nn.Linear(
-            config.hidden_dim, config.discrete_dim
-        )
-
-        # Reconstruct continuous features
-        self.continuous_reconstruction: nn.Sequential = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, d_ff),
             nn.GELU(),
-            nn.Linear(config.hidden_dim // 2, config.continuous_dim)
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout)
         )
 
-    def encode(
-        self,
-        x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Encode input sequences
+    def forward(self, x):
+        # Self-attention with residual connection
+        attn_output = self.attention(x)
+        x = self.norm1(x + attn_output)
 
-        Args:
-            x: input tensor of shape (batch, seq_len, total_input_dim)
+        # Feed-forward with residual connection
+        ff_output = self.feed_forward(x)
+        x = self.norm2(x + ff_output)
 
-        Returns:
-            quantized: quantized representation (batch, seq_len, compressed_dim)
-            indices: quantization indices (batch, seq_len, num_quantizers)
-            vq_loss: vector quantization loss
-            encoded: encoder output before quantization (batch, seq_len, hidden_dim)
-        """
-        # Process mixed features
-        features: torch.Tensor = self.feature_encoder(x)
+        return x
 
-        # Encode with Reformer
-        encoder_output = self.encoder(inputs_embeds=features)
-        encoded: torch.Tensor = encoder_output.last_hidden_state
 
-        # Project to compression dimension
-        compressed: torch.Tensor = self.compress_projection(encoded)
+class VQVAEEncoder(nn.Module):
+    """
+    Encoder that projects input, applies self-attention, and quantizes.
+    """
 
-        # Apply RVQ
-        quantized, indices, vq_loss = self.rvq(compressed)
+    def __init__(self, d1, d2, num_embeddings, n_attention_blocks=3, n_heads=8,
+                 dropout=0.1, use_cross_entropy=False, temperature=1.0):
+        super().__init__()
 
-        return quantized, indices, vq_loss, encoded
+        # Initial projection
+        self.input_projection = nn.Linear(d1, d2)
 
-    def decode(self, quantized: torch.Tensor) -> torch.Tensor:
-        """
-        Decode from quantized representation
+        # Self-attention blocks
+        self.attention_blocks = nn.ModuleList([
+            TransformerBlock(d2, n_heads, dropout=dropout)
+            for _ in range(n_attention_blocks)
+        ])
 
-        Args:
-            quantized: quantized tensor of shape (batch, seq_len, compressed_dim)
+        # Pre-quantization normalization
+        self.pre_quant_norm = nn.LayerNorm(d2)
 
-        Returns:
-            reconstructed: reconstructed input (batch, seq_len, total_input_dim)
-        """
-        # Project back to hidden dimension
-        decompressed: torch.Tensor = self.decompress_projection(quantized)
+        # Vector quantization with cross-entropy option
+        self.quantizer = VectorQuantizer(
+            num_embeddings, d2,
+            use_dcae=use_cross_entropy,
+            temperature=temperature
+        )
 
-        # Decode with Reformer
-        decoder_output = self.decoder(inputs_embeds=decompressed)
-        decoded: torch.Tensor = decoder_output.last_hidden_state
+    def forward(self, x):
+        # Project input from d1 to d2
+        x = self.input_projection(x)
 
-        # Project to output
-        output_features: torch.Tensor = self.output_projection(decoded)
+        # Apply self-attention blocks
+        for block in self.attention_blocks:
+            x = block(x)
 
-        # Reconstruct discrete and continuous parts
-        discrete_recon: torch.Tensor = self.discrete_reconstruction(output_features)
-        continuous_recon: torch.Tensor = self.continuous_reconstruction(output_features)
+        # Normalize before quantization
+        x = self.pre_quant_norm(x)
 
-        # Combine reconstructions
-        reconstructed: torch.Tensor = torch.cat([discrete_recon, continuous_recon], dim=-1)
+        # Quantize
+        quantized, vq_loss, perplexity, encoding_indices = self.quantizer(x)
 
-        return reconstructed
+        return quantized, vq_loss, perplexity, encoding_indices
 
-    def forward(
-        self,
-        x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Full forward pass with encoding and decoding
 
-        Args:
-            x: input tensor of shape (batch, seq_len, total_input_dim)
+class VQVAEDecoder(nn.Module):
+    """
+    Decoder that reconstructs the original input from quantized representations.
+    """
 
-        Returns:
-            reconstructed: reconstructed input (batch, seq_len, total_input_dim)
-            indices: quantization indices (batch, seq_len, num_quantizers)
-            vq_loss: vector quantization loss
-        """
-        # Encode
-        quantized, indices, vq_loss, _ = self.encode(x)
+    def __init__(self, d2, d1, n_attention_blocks=3, n_heads=8, dropout=0.1):
+        super().__init__()
+
+        # Self-attention blocks
+        self.attention_blocks = nn.ModuleList([
+            TransformerBlock(d2, n_heads, dropout=dropout)
+            for _ in range(n_attention_blocks)
+        ])
+
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.LayerNorm(d2),
+            nn.Linear(d2, d1)
+        )
+
+    def forward(self, x):
+        # Apply self-attention blocks
+        for block in self.attention_blocks:
+            x = block(x)
+
+        # Project back to original dimension
+        x = self.output_projection(x)
+
+        return x
+
+
+class VQVAE(nn.Module):
+    """
+    Complete VQ-VAE model with encoder and decoder.
+    Supports both L2 distance and cross-entropy based vector quantization.
+    """
+
+    def __init__(self, d1, d2, num_embeddings, n_encoder_blocks=3, n_decoder_blocks=3,
+                 n_heads=8, dropout=0.1, commitment_cost=0.25,
+                 use_cross_entropy=False, temperature=1.0):
+        super().__init__()
+
+        self.encoder = VQVAEEncoder(
+            d1, d2, num_embeddings,
+            n_attention_blocks=n_encoder_blocks,
+            n_heads=n_heads,
+            dropout=dropout,
+            use_cross_entropy=use_cross_entropy,
+            temperature=temperature
+        )
+
+        self.decoder = VQVAEDecoder(
+            d2, d1,
+            n_attention_blocks=n_decoder_blocks,
+            n_heads=n_heads,
+            dropout=dropout
+        )
+
+        # Store commitment cost for loss calculation
+        self.commitment_cost = commitment_cost
+        self.use_cross_entropy = use_cross_entropy
+
+    def forward(self, x):
+        # Encode and quantize
+        quantized, vq_loss, perplexity, encoding_indices = self.encoder(x)
 
         # Decode
-        reconstructed = self.decode(quantized)
+        reconstructed = self.decoder(quantized)
 
-        return reconstructed, indices, vq_loss
+        return reconstructed, quantized, vq_loss, perplexity, encoding_indices
 
-    def compress_ratio(self) -> float:
-        """Calculate theoretical compression ratio"""
-        # Original: total_input_dim * 32 bits (assuming float32)
-        # Compressed: num_quantizers * log2(codebook_size) bits
-        original_bits: float = self.config.total_input_dim * 32
-        compressed_bits: float = self.config.num_quantizers * np.log2(self.config.codebook_size)
-        return original_bits / compressed_bits
-
-    def get_compressed_representation(
-        self,
-        x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_loss(self, x, reconstructed, vq_loss, beta=1.0):
         """
-        Get only the compressed representation without decoding
+        Compute the total loss for VQ-VAE.
 
         Args:
-            x: input tensor of shape (batch, seq_len, total_input_dim)
+            x: Original input tensor (batch_size, seq_len, d1)
+            reconstructed: Reconstructed tensor (batch_size, seq_len, d1)
+            vq_loss: Vector quantization loss from encoder
+            beta: Weight for reconstruction loss
 
         Returns:
-            quantized: quantized representation (batch, seq_len, compressed_dim)
-            indices: quantization indices (batch, seq_len, num_quantizers)
+            Dictionary containing individual losses and total loss
         """
-        quantized, indices, _, _ = self.encode(x)
-        return quantized, indices
+        # Reconstruction loss
+        recon_loss = F.mse_loss(reconstructed, x)
+
+        # Total loss
+        total_loss = beta * recon_loss + vq_loss
+
+        return {
+            'total_loss': total_loss,
+            'recon_loss': recon_loss,
+            'vq_loss': vq_loss
+        }
+
+    def encode(self, x):
+        """
+        Encode input to quantized representation.
+        """
+        quantized, _, _, encoding_indices = self.encoder(x)
+        return quantized, encoding_indices
+
+    def decode(self, quantized):
+        """
+        Decode from quantized representation.
+        """
+        return self.decoder(quantized)
+
+    def decode_from_indices(self, indices):
+        """
+        Decode directly from codebook indices.
+
+        Args:
+            indices: Tensor of shape (batch_size, seq_len) containing codebook indices
+
+        Returns:
+            Reconstructed tensor of shape (batch_size, seq_len, d1)
+        """
+        # Get embeddings from codebook
+        quantized = self.encoder.quantizer.embedding(indices)
+
+        # Decode
+        return self.decoder(quantized)
+
+
+class CpDataset(Dataset):
+    """Dataset for loading token sequences from cached files"""
+
+    def __init__(self, files: list[str]):
+        self.files = files
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int):
+        return self.get(idx)
+
+    def get(self, idx: int) -> torch.Tensor:
+        """
+        Get a single item by index
+
+        Args:
+            idx: Index of the item
+
+        Returns:
+            - data_tensor: Tensor of shape (seq_len, input_dim)
+        """
+        file = self.files[idx]
+        try:
+            data = load_musicxml_tokens(file)
+        except Exception as e:
+            logging.error(f"Error loading {file}: {e}")
+            return self.__getitem__(np.random.randint(0, len(self.files)))
+
+        data_tensor = torch.from_numpy(data).float()
+        return data_tensor
+
+
+@cache
+def get_token_dims():
+    """Get the input dimension of the tokenized data"""
+    from ..test import BACH_C_MAJOR_PRELUDE
+    tokens = musicxml_to_tokens(musicxml_to_notes(BACH_C_MAJOR_PRELUDE))
+    return tokens.shape[-1]
+
+
+def load_musicxml_tokens(file_path: str) -> np.ndarray:
+    """Load and tokenize MusicXML file"""
+    try:
+        notes = musicxml_to_notes(file_path)
+        tokens = musicxml_to_tokens(notes)
+        return tokens
+    except Exception as e:
+        logging.error(f"Error loading {file_path}: {e}")
+        return np.array([]).reshape(0, get_token_dims())
