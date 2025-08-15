@@ -1,7 +1,4 @@
 # Tokenizes MIDI compound words (cp) into discrete tokens
-# script trains the model
-# python -m src.model.cp_tokenizer
-
 
 import os
 import torch
