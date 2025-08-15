@@ -11,6 +11,8 @@ from datetime import datetime
 import json
 import random
 import numpy as np
+from dataclasses import dataclass, asdict, field
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
@@ -23,13 +25,125 @@ from tqdm import tqdm
 import logging
 from typing import Dict, Optional, Tuple
 
-# Import your model components (adjust import paths as needed)
-from src.model.cp_tokenizer import (
-    CpConfig, VQVAE, CpDataset, CpDataCollator,
-    get_model, create_dataloader, train_step, get_token_dims
-)
+from src.model.cp_tokenizer import CpConfig, VQVAE, CpDataset, CpDataCollator, get_model
 
-from src.util import get_all_xml_paths
+
+@dataclass
+class TrainingConfig:
+    """Configuration for training the VQ-VAE model."""
+
+    # Model configuration
+    hidden_dims: int = 512
+    num_embeddings: int = 8192
+    n_heads: int = 8
+    n_encoder_blocks: int = 8
+    n_decoder_blocks: int = 8
+    use_dcae: bool = False
+    temperature: float = 1.0
+    dropout: float = 0.1
+
+    # Training configuration
+    batch_size: int = 8
+    grad_accumulation_steps: int = 8
+    max_seq_length: int = 2048
+    num_epochs: int = 100
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    gradient_clip: float = 1.0
+    beta: float = 1.0
+    warmup_epochs: int = 5
+    scheduler: str = 'cosine'  # Options: 'none', 'cosine', 'plateau'
+
+    # Data configuration
+    val_split: float = 0.1
+
+    # Logging configuration
+    output_dir: str = 'outputs/vqvae'
+    log_interval: int = 10
+    save_interval: int = 5
+
+    # Wandb configuration
+    run_name: Optional[str] = None
+    wandb_project: str = 'cp-tokenizer-1'
+    wandb_entity: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
+    no_wandb: bool = False
+
+    # Other configuration
+    seed: int = 42
+    resume_from: Optional[str] = None
+    early_stopping_patience: int = 0
+
+    def to_cp_config(self) -> CpConfig:
+        """Convert to CpConfig for model initialization."""
+        return CpConfig(
+            hidden_dims=self.hidden_dims,
+            num_embeddings=self.num_embeddings,
+            n_heads=self.n_heads,
+            n_encoder_blocks=self.n_encoder_blocks,
+            n_decoder_blocks=self.n_decoder_blocks,
+            use_dcae=self.use_dcae,
+            dropout=self.dropout,
+            temperature=self.temperature,
+            batch_size=self.batch_size,
+            max_seq_length=self.max_seq_length
+        )
+
+    def to_dict(self) -> dict:
+        """Convert config to dictionary for wandb logging."""
+        return asdict(self)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> 'TrainingConfig':
+        """Create TrainingConfig from parsed arguments."""
+        # Handle wandb_tags separately since it needs to be converted from string to list
+        wandb_tags = None
+        if args.wandb_tags:
+            wandb_tags = args.wandb_tags.split(',')
+
+        return cls(
+            hidden_dims=args.hidden_dims,
+            num_embeddings=args.num_embeddings,
+            n_heads=args.n_heads,
+            n_encoder_blocks=args.n_encoder_blocks,
+            n_decoder_blocks=args.n_decoder_blocks,
+            use_dcae=args.use_dcae,
+            temperature=args.temperature,
+            dropout=args.dropout,
+            batch_size=args.batch_size,
+            max_seq_length=args.max_seq_length,
+            num_epochs=args.num_epochs,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            gradient_clip=args.gradient_clip,
+            beta=args.beta,
+            warmup_epochs=args.warmup_epochs,
+            scheduler=args.scheduler,
+            val_split=args.val_split,
+            output_dir=args.output_dir,
+            log_interval=args.log_interval,
+            save_interval=args.save_interval,
+            run_name=args.run_name,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            wandb_tags=wandb_tags,
+            no_wandb=args.no_wandb,
+            seed=args.seed,
+            resume_from=args.resume_from,
+            early_stopping_patience=args.early_stopping_patience
+        )
+
+    def save(self, path: Path):
+        """Save configuration to JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: Path) -> 'TrainingConfig':
+        """Load configuration from JSON file."""
+        with open(path, 'r') as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
 
 
 def setup_logging(log_dir: Path):
@@ -57,20 +171,21 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def create_train_val_dataloaders(config: CpConfig, val_split: float = 0.1) -> Tuple[DataLoader, DataLoader]:
+def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
     """
     Create training and validation dataloaders.
 
     Args:
-        config: Model configuration
-        val_split: Fraction of data to use for validation
+        config: Training configuration
 
     Returns:
         Tuple of (train_dataloader, val_dataloader)
     """
+    from src.util import get_all_xml_paths
+
     files = get_all_xml_paths()
     total_files = len(files)
-    val_size = int(total_files * val_split)
+    val_size = int(total_files * config.val_split)
     train_size = total_files - val_size
 
     # Shuffle files and split
@@ -79,8 +194,16 @@ def create_train_val_dataloaders(config: CpConfig, val_split: float = 0.1) -> Tu
     val_files = files[train_size:]
 
     # Create datasets
-    train_dataset = CpDataset(train_files, max_seq_length=config.max_seq_length, on_too_long='truncate')
-    val_dataset = CpDataset(val_files, max_seq_length=config.max_seq_length, on_too_long='truncate')
+    train_dataset = CpDataset(
+        train_files,
+        max_seq_length=config.max_seq_length,
+        on_too_long='truncate'
+    )
+    val_dataset = CpDataset(
+        val_files,
+        max_seq_length=config.max_seq_length,
+        on_too_long='truncate'
+    )
 
     # Create collator
     collator = CpDataCollator(pad_value=0.0)
@@ -158,9 +281,9 @@ def validate(model: VQVAE, val_dataloader: DataLoader, device: torch.device) -> 
 
 
 def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
-                    scheduler: Optional[object], epoch: int,
+                    scheduler, epoch: int,
                     metrics: Dict[str, float], checkpoint_dir: Path,
-                    is_best: bool = False):
+                    config: TrainingConfig, is_best: bool = False):
     """
     Save model checkpoint.
 
@@ -171,6 +294,7 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
         epoch: Current epoch
         metrics: Current metrics
         checkpoint_dir: Directory to save checkpoints
+        config: Training configuration
         is_best: Whether this is the best model so far
     """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -179,7 +303,8 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'metrics': metrics
+        'metrics': metrics,
+        'config': config.to_dict()
     }
 
     if scheduler is not None:
@@ -198,12 +323,15 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
     latest_path = checkpoint_dir / 'latest_checkpoint.pt'
     torch.save(checkpoint, latest_path)
 
+    # Save config alongside checkpoint
+    config.save(checkpoint_dir / 'config.json')
+
     logging.info(f"Saved checkpoint to {checkpoint_path}")
 
 
 def load_checkpoint(checkpoint_path: Path, model: VQVAE,
                     optimizer: Optional[torch.optim.Optimizer] = None,
-                    scheduler: Optional[object] = None) -> int:
+                    scheduler=None) -> int:
     """
     Load model checkpoint.
 
@@ -229,100 +357,97 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
     return checkpoint.get('epoch', 0) + 1
 
 
-def train(config: CpConfig, args: argparse.Namespace):
+def train(config: TrainingConfig):
     """
     Main training loop.
 
     Args:
-        config: Model configuration
-        args: Command line arguments
+        config: Training configuration containing all hyperparameters
     """
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    set_seed(args.seed)
+    set_seed(config.seed)
 
     # Create directories
-    output_dir = Path(args.output_dir)
+    output_dir = Path(config.output_dir)
     checkpoint_dir = output_dir / 'checkpoints'
     log_dir = output_dir / 'logs'
 
     # Setup logging
     logger = setup_logging(log_dir)
-    logger.info(f"Starting training with config: {config}")
+    logger.info(f"Starting training with config:")
+    logger.info(json.dumps(config.to_dict(), indent=2))
     logger.info(f"Using device: {device}")
 
-    # Initialize wandb
-    run_name = args.run_name or f"vqvae_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Save config
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config.save(output_dir / 'config.json')
 
-    wandb_config = {
-        **config.__dict__,
-        'run_name': run_name,
-        'learning_rate': args.learning_rate,
-        'num_epochs': args.num_epochs,
-        'val_split': args.val_split,
-        'seed': args.seed,
-        'gradient_clip': args.gradient_clip,
-        'warmup_epochs': args.warmup_epochs,
-        'scheduler': args.scheduler,
-        'beta': args.beta
-    }
+    # Initialize wandb
+    run_name = config.run_name or f"vqvae_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Add run_name to wandb config
+    wandb_config = config.to_dict()
+    wandb_config['run_name'] = run_name
 
     wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
+        project=config.wandb_project,
+        entity=config.wandb_entity,
         name=run_name,
         config=wandb_config,
-        tags=args.wandb_tags.split(',') if args.wandb_tags else None,
-        mode='online' if not args.no_wandb else 'disabled'
+        tags=config.wandb_tags,
+        mode='online' if not config.no_wandb else 'disabled'
     )
 
     # Create model
-    model = get_model(config)
+    cp_config = config.to_cp_config()
+    model = get_model(cp_config)
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Create dataloaders
-    train_dataloader, val_dataloader = create_train_val_dataloaders(config, args.val_split)
+    train_dataloader, val_dataloader = create_train_val_dataloaders(config)
     logger.info(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
 
     # Create optimizer
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
         betas=(0.9, 0.999),
         eps=1e-8
     )
 
     # Create learning rate scheduler
     scheduler = None
-    if args.scheduler == 'cosine':
+    if config.scheduler == 'cosine':
         scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=args.num_epochs,
-            eta_min=args.learning_rate * 0.01
+            T_max=config.num_epochs,
+            eta_min=config.learning_rate * 0.01
         )
-    elif args.scheduler == 'plateau':
+    elif config.scheduler == 'plateau':
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=0.5,
             patience=5,
-            verbose=True
         )
 
     # Load checkpoint if resuming
     start_epoch = 0
-    if args.resume_from:
+    if config.resume_from:
         start_epoch = load_checkpoint(
-            Path(args.resume_from),
+            Path(config.resume_from),
             model, optimizer, scheduler
         )
 
     # Training loop
     best_val_loss = float('inf')
     global_step = 0
+    epochs_without_improvement = 0
+    epoch_metrics: dict[str, float] = {}
 
-    for epoch in range(start_epoch, args.num_epochs):
+    for epoch in range(start_epoch, config.num_epochs):
         epoch_start_time = datetime.now()
 
         # Training phase
@@ -335,7 +460,7 @@ def train(config: CpConfig, args: argparse.Namespace):
         }
         num_train_batches = 0
 
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
 
         for batch_idx, batch in enumerate(progress_bar):
             # Move batch to device
@@ -343,24 +468,24 @@ def train(config: CpConfig, args: argparse.Namespace):
             attention_mask = batch['attention_mask'].to(device)
 
             # Learning rate warmup
-            if epoch < args.warmup_epochs:
-                warmup_factor = (epoch * len(train_dataloader) + batch_idx + 1) / (args.warmup_epochs * len(train_dataloader))
+            if epoch < config.warmup_epochs:
+                warmup_factor = (epoch * len(train_dataloader) + batch_idx + 1) / (config.warmup_epochs * len(train_dataloader))
                 for param_group in optimizer.param_groups:
-                    param_group['lr'] = args.learning_rate * warmup_factor
+                    param_group['lr'] = config.learning_rate * warmup_factor
 
             # Forward pass
             optimizer.zero_grad()
             reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
 
             # Compute losses with beta weighting
-            losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=args.beta)
+            losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
 
             # Backward pass
             losses['total_loss'].backward()
 
             # Gradient clipping
-            if args.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
+            if config.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
 
             optimizer.step()
 
@@ -381,7 +506,7 @@ def train(config: CpConfig, args: argparse.Namespace):
             })
 
             # Log to wandb
-            if global_step % args.log_interval == 0:
+            if global_step % config.log_interval == 0:
                 wandb.log({
                     'train/loss': losses['total_loss'].item(),
                     'train/recon_loss': losses['recon_loss'].item(),
@@ -400,7 +525,7 @@ def train(config: CpConfig, args: argparse.Namespace):
 
         # Update learning rate scheduler
         if scheduler is not None:
-            if args.scheduler == 'plateau':
+            if isinstance(scheduler, ReduceLROnPlateau):
                 scheduler.step(val_metrics['val_loss'])
             else:
                 scheduler.step()
@@ -416,19 +541,22 @@ def train(config: CpConfig, args: argparse.Namespace):
         is_best = val_metrics['val_loss'] < best_val_loss
         if is_best:
             best_val_loss = val_metrics['val_loss']
+            epochs_without_improvement = 0
             logger.info(f"New best model! Val loss: {best_val_loss:.4f}")
+        else:
+            epochs_without_improvement += 1
 
         # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0 or is_best:
+        if (epoch + 1) % config.save_interval == 0 or is_best:
             save_checkpoint(
                 model, optimizer, scheduler, epoch + 1,
-                epoch_metrics, checkpoint_dir, is_best
+                epoch_metrics, checkpoint_dir, config, is_best
             )
 
         # Log epoch summary
         epoch_time = (datetime.now() - epoch_start_time).total_seconds()
         logger.info(
-            f"Epoch {epoch+1}/{args.num_epochs} - "
+            f"Epoch {epoch+1}/{config.num_epochs} - "
             f"Train Loss: {train_losses['train_loss']:.4f}, "
             f"Val Loss: {val_metrics['val_loss']:.4f}, "
             f"Val Perplexity: {val_metrics['val_perplexity']:.2f}, "
@@ -436,15 +564,15 @@ def train(config: CpConfig, args: argparse.Namespace):
         )
 
         # Early stopping check
-        if args.early_stopping_patience > 0:
-            if epoch - best_val_loss > args.early_stopping_patience:
+        if config.early_stopping_patience > 0:
+            if epochs_without_improvement >= config.early_stopping_patience:
                 logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                 break
 
     # Final save
     save_checkpoint(
-        model, optimizer, scheduler, args.num_epochs,
-        epoch_metrics, checkpoint_dir, is_best=False
+        model, optimizer, scheduler, config.num_epochs,
+        epoch_metrics, checkpoint_dir, config, is_best=False
     )
 
     # Close wandb
@@ -477,6 +605,8 @@ def main():
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size')
+    parser.add_argument('--grad_accumulation_steps', type=int, default=8,
+                        help='Gradient accumulation steps')
     parser.add_argument('--max_seq_length', type=int, default=2048,
                         help='Maximum sequence length')
     parser.add_argument('--num_epochs', type=int, default=100,
@@ -527,24 +657,24 @@ def main():
     parser.add_argument('--early_stopping_patience', type=int, default=0,
                         help='Early stopping patience (0 to disable)')
 
+    # Config file support
+    parser.add_argument('--config_file', type=str, default=None,
+                        help='Load configuration from JSON file')
+
     args = parser.parse_args()
 
-    # Create configuration
-    config = CpConfig(
-        hidden_dims=args.hidden_dims,
-        num_embeddings=args.num_embeddings,
-        n_heads=args.n_heads,
-        n_encoder_blocks=args.n_encoder_blocks,
-        n_decoder_blocks=args.n_decoder_blocks,
-        use_dcae=args.use_dcae,
-        dropout=args.dropout,
-        temperature=args.temperature,
-        batch_size=args.batch_size,
-        max_seq_length=args.max_seq_length
-    )
+    # Load config from file if provided, otherwise create from args
+    if args.config_file:
+        config = TrainingConfig.load(Path(args.config_file))
+        # Override with any command line arguments
+        for key, value in vars(args).items():
+            if key != 'config_file' and value is not None:
+                setattr(config, key, value)
+    else:
+        config = TrainingConfig.from_args(args)
 
     # Run training
-    train(config, args)
+    train(config)
 
 
 if __name__ == '__main__':
