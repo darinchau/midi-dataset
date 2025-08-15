@@ -1,5 +1,7 @@
 # Tokenizes MIDI compound words (cp) into discrete tokens
 
+from torch.utils.data import DataLoader
+from ..util import get_all_xml_paths
 import os
 import torch
 import torch.nn as nn
@@ -11,6 +13,7 @@ from dataclasses import dataclass
 import logging
 from functools import cache
 from tqdm import tqdm
+from typing import Dict, List, Optional, Union
 from ..extract import musicxml_to_notes
 from ..extract.tokenize import notes_to_tokens
 from ..constants import XML_ROOT
@@ -49,6 +52,12 @@ class CpConfig:
     # Batch size for training
     batch_size: int = 32
 
+    # Maximum sequence length (for truncation)
+    max_seq_length: int = 2048
+
+    # Padding token value
+    pad_token_id: int = 0
+
 
 class VectorQuantizer(nn.Module):
     """
@@ -76,12 +85,20 @@ class VectorQuantizer(nn.Module):
             # Learnable temperature parameter
             self.temperature_param = nn.Parameter(torch.ones(1) * temperature)
 
-    def forward(self, inputs):
+    def forward(self, inputs, attention_mask=None):
         # inputs shape: (batch, sequence_length, embedding_dim)
         batch_size, seq_len, _ = inputs.shape
 
+        # Create mask for valid positions
+        if attention_mask is not None:
+            # attention_mask shape: (batch, sequence_length)
+            valid_mask = attention_mask.bool().unsqueeze(-1)  # (batch, seq_len, 1)
+        else:
+            valid_mask = torch.ones(batch_size, seq_len, 1, device=inputs.device, dtype=torch.bool)
+
         # Flatten input
         flat_input = inputs.view(-1, self.embedding_dim)
+        flat_mask = valid_mask.view(-1, 1)
 
         if self.use_dcae:
             # dcae based assignment (similarity-based)
@@ -91,6 +108,9 @@ class VectorQuantizer(nn.Module):
 
             # Compute similarity scores (dot product)
             similarity_scores = torch.matmul(queries, keys.t()) / self.temperature_param
+
+            # Mask invalid positions
+            similarity_scores = similarity_scores.masked_fill(~flat_mask, -1e9)
 
             # Get assignments using softmax (soft assignment during training)
             attention_weights = F.softmax(similarity_scores, dim=-1)
@@ -106,21 +126,36 @@ class VectorQuantizer(nn.Module):
             quantized_soft = torch.matmul(attention_weights, self.embedding.weight)
             quantized_hard = torch.matmul(encodings, self.embedding.weight)
 
+            # Apply mask to quantized values
+            quantized_soft = quantized_soft * flat_mask
+            quantized_hard = quantized_hard * flat_mask
+
             # Reshape back
             quantized_soft = quantized_soft.view(batch_size, seq_len, self.embedding_dim)
             quantized_hard = quantized_hard.view(batch_size, seq_len, self.embedding_dim)
 
-            # Compute losses
-            # Commitment loss: encourage input to be close to selected codebook entry
-            commitment_loss = F.mse_loss(quantized_hard.detach(), inputs)
+            # Compute losses only for valid positions
+            masked_inputs = inputs * valid_mask
+            masked_quantized_hard = quantized_hard * valid_mask
 
-            # Codebook loss: encourage codebook to be close to input
-            codebook_loss = F.mse_loss(quantized_hard, inputs.detach())
+            # Commitment loss: encourage input to be close to selected codebook entry
+            if attention_mask is not None:
+                num_valid = attention_mask.sum()
+                commitment_loss = F.mse_loss(masked_quantized_hard, masked_inputs, reduction='sum') / num_valid
+                codebook_loss = F.mse_loss(masked_quantized_hard, masked_inputs, reduction='sum') / num_valid
+            else:
+                commitment_loss = F.mse_loss(quantized_hard.detach(), inputs)
+                codebook_loss = F.mse_loss(quantized_hard, inputs.detach())
 
             # Entropy regularization (encourage diverse codebook usage)
-            avg_probs = torch.mean(attention_weights, dim=0)
-            entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
-            entropy_reg = -0.01 * entropy  # negative because we want to maximize entropy
+            valid_attention_weights = attention_weights[flat_mask.squeeze()]
+            if valid_attention_weights.numel() > 0:
+                avg_probs = torch.mean(valid_attention_weights, dim=0)
+                entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
+                entropy_reg = -0.01 * entropy  # negative because we want to maximize entropy
+            else:
+                entropy_reg = 0.0
+                avg_probs = torch.tensor(1.0, device=inputs.device)
 
             loss = codebook_loss + self.commitment_cost * commitment_loss + entropy_reg
 
@@ -128,7 +163,10 @@ class VectorQuantizer(nn.Module):
             quantized = inputs + (quantized_hard - inputs).detach()
 
             # Use attention weights for perplexity calculation
-            perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+            if valid_attention_weights.numel() > 0:
+                perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+            else:
+                perplexity = torch.tensor(1.0, device=inputs.device)
 
         else:
             # Original L2 distance based assignment
@@ -136,25 +174,43 @@ class VectorQuantizer(nn.Module):
                          + torch.sum(self.embedding.weight**2, dim=1)
                          - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
 
+            # Mask invalid positions
+            distances = distances.masked_fill(~flat_mask, float('inf'))
+
             # Get nearest codebook entries
             encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
             encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
             encodings.scatter_(1, encoding_indices, 1)
 
             # Quantize using codebook
-            quantized = torch.matmul(encodings, self.embedding.weight).view(batch_size, seq_len, self.embedding_dim)
+            quantized_flat = torch.matmul(encodings, self.embedding.weight)
+            quantized_flat = quantized_flat * flat_mask
+            quantized = quantized_flat.view(batch_size, seq_len, self.embedding_dim)
 
-            # Compute losses
-            e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-            q_latent_loss = F.mse_loss(quantized, inputs.detach())
+            # Compute losses only for valid positions
+            masked_inputs = inputs * valid_mask
+            masked_quantized = quantized * valid_mask
+
+            if attention_mask is not None:
+                num_valid = attention_mask.sum()
+                e_latent_loss = F.mse_loss(masked_quantized.detach(), masked_inputs, reduction='sum') / num_valid
+                q_latent_loss = F.mse_loss(masked_quantized, masked_inputs.detach(), reduction='sum') / num_valid
+            else:
+                e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+                q_latent_loss = F.mse_loss(quantized, inputs.detach())
+
             loss = q_latent_loss + self.commitment_cost * e_latent_loss
 
             # Straight-through estimator
             quantized = inputs + (quantized - inputs).detach()
 
             # Perplexity for monitoring
-            avg_probs = torch.mean(encodings, dim=0)
-            perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+            valid_encodings = encodings[flat_mask.squeeze()]
+            if valid_encodings.numel() > 0:
+                avg_probs = torch.mean(valid_encodings, dim=0)
+                perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+            else:
+                perplexity = torch.tensor(1.0, device=inputs.device)
 
         encoding_indices = encoding_indices.view(batch_size, seq_len)
         return quantized, loss, perplexity, encoding_indices
@@ -180,7 +236,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         batch_size, seq_len, _ = x.shape
 
         # Linear transformations and split into heads
@@ -190,6 +246,15 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            # attention_mask shape: (batch, seq_len)
+            # Expand mask for all heads
+            mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq_len)
+            mask = mask.expand(-1, self.n_heads, seq_len, -1)  # (batch, n_heads, seq_len, seq_len)
+            scores = scores.masked_fill(mask == 0, -1e9)
+
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
@@ -227,9 +292,9 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Self-attention with residual connection
-        attn_output = self.attention(x)
+        attn_output = self.attention(x, attention_mask)
         x = self.norm1(x + attn_output)
 
         # Feed-forward with residual connection
@@ -267,19 +332,19 @@ class VQVAEEncoder(nn.Module):
             temperature=temperature
         )
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Project input from d1 to d2
         x = self.input_projection(x)
 
         # Apply self-attention blocks
         for block in self.attention_blocks:
-            x = block(x)
+            x = block(x, attention_mask)
 
         # Normalize before quantization
         x = self.pre_quant_norm(x)
 
         # Quantize
-        quantized, vq_loss, perplexity, encoding_indices = self.quantizer(x)
+        quantized, vq_loss, perplexity, encoding_indices = self.quantizer(x, attention_mask)
 
         return quantized, vq_loss, perplexity, encoding_indices
 
@@ -304,10 +369,10 @@ class VQVAEDecoder(nn.Module):
             nn.Linear(d2, d1)
         )
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Apply self-attention blocks
         for block in self.attention_blocks:
-            x = block(x)
+            x = block(x, attention_mask)
 
         # Project back to original dimension
         x = self.output_projection(x)
@@ -346,16 +411,16 @@ class VQVAE(nn.Module):
         self.commitment_cost = commitment_cost
         self.use_dcae = use_dcae
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Encode and quantize
-        quantized, vq_loss, perplexity, encoding_indices = self.encoder(x)
+        quantized, vq_loss, perplexity, encoding_indices = self.encoder(x, attention_mask)
 
         # Decode
-        reconstructed = self.decoder(quantized)
+        reconstructed = self.decoder(quantized, attention_mask)
 
         return reconstructed, quantized, vq_loss, perplexity, encoding_indices
 
-    def compute_loss(self, x, reconstructed, vq_loss, beta=1.0):
+    def compute_loss(self, x, reconstructed, vq_loss, attention_mask=None, beta=1.0):
         """
         Compute the total loss for VQ-VAE.
 
@@ -363,13 +428,22 @@ class VQVAE(nn.Module):
             x: Original input tensor (batch_size, seq_len, d1)
             reconstructed: Reconstructed tensor (batch_size, seq_len, d1)
             vq_loss: Vector quantization loss from encoder
+            attention_mask: Optional attention mask (batch_size, seq_len)
             beta: Weight for reconstruction loss
 
         Returns:
             Dictionary containing individual losses and total loss
         """
         # Reconstruction loss
-        recon_loss = F.mse_loss(reconstructed, x)
+        if attention_mask is not None:
+            # Only compute loss for valid positions
+            mask = attention_mask.unsqueeze(-1)  # (batch_size, seq_len, 1)
+            masked_x = x * mask
+            masked_reconstructed = reconstructed * mask
+            num_valid = attention_mask.sum()
+            recon_loss = F.mse_loss(masked_reconstructed, masked_x, reduction='sum') / num_valid
+        else:
+            recon_loss = F.mse_loss(reconstructed, x)
 
         # Total loss
         total_loss = beta * recon_loss + vq_loss
@@ -380,25 +454,26 @@ class VQVAE(nn.Module):
             'vq_loss': vq_loss
         }
 
-    def encode(self, x):
+    def encode(self, x, attention_mask=None):
         """
         Encode input to quantized representation.
         """
-        quantized, _, _, encoding_indices = self.encoder(x)
+        quantized, _, _, encoding_indices = self.encoder(x, attention_mask)
         return quantized, encoding_indices
 
-    def decode(self, quantized):
+    def decode(self, quantized, attention_mask=None):
         """
         Decode from quantized representation.
         """
-        return self.decoder(quantized)
+        return self.decoder(quantized, attention_mask)
 
-    def decode_from_indices(self, indices):
+    def decode_from_indices(self, indices, attention_mask=None):
         """
         Decode directly from codebook indices.
 
         Args:
             indices: Tensor of shape (batch_size, seq_len) containing codebook indices
+            attention_mask: Optional attention mask
 
         Returns:
             Reconstructed tensor of shape (batch_size, seq_len, d1)
@@ -407,14 +482,22 @@ class VQVAE(nn.Module):
         quantized = self.encoder.quantizer.embedding(indices)
 
         # Decode
-        return self.decoder(quantized)
+        return self.decoder(quantized, attention_mask)
 
 
 class CpDataset(Dataset):
-    """Dataset for loading token sequences from cached files"""
+    """Dataset for loading token sequences from cached files
 
-    def __init__(self, files: list[str]):
+    Args:
+        files: List of file paths containing tokenized sequences
+        max_seq_length: Maximum sequence length for truncation
+        on_too_long: Action to take if sequence exceeds max length ('truncate' or 'skip')
+"""
+
+    def __init__(self, files: list[str], max_seq_length: Optional[int] = None, on_too_long: str = 'truncate'):
         self.files = files
+        self.max_seq_length = max_seq_length
+        self.on_too_long = on_too_long
 
     def __len__(self) -> int:
         return len(self.files)
@@ -422,7 +505,7 @@ class CpDataset(Dataset):
     def __getitem__(self, idx: int):
         return self.get(idx)
 
-    def get(self, idx: int) -> torch.Tensor:
+    def get(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a single item by index
 
@@ -430,7 +513,9 @@ class CpDataset(Dataset):
             idx: Index of the item
 
         Returns:
-            - data_tensor: Tensor of shape (seq_len, input_dim)
+            Dictionary containing:
+            - input_ids: Tensor of shape (seq_len, input_dim)
+            - length: Original sequence length
         """
         file = self.files[idx]
         try:
@@ -440,7 +525,79 @@ class CpDataset(Dataset):
             return self.__getitem__(np.random.randint(0, len(self.files)))
 
         data_tensor = torch.from_numpy(data).float()
-        return data_tensor
+
+        #
+        if self.max_seq_length is not None and data_tensor.shape[0] > self.max_seq_length:
+            if self.on_too_long == 'truncate':
+                data_tensor = data_tensor[:self.max_seq_length]
+            elif self.on_too_long == 'skip':
+                return self.__getitem__(np.random.randint(0, len(self.files)))
+            else:
+                raise ValueError(f"Invalid on_too_long value: {self.on_too_long}")
+
+        return {
+            'input_ids': data_tensor,
+            'length': torch.tensor(data_tensor.shape[0], dtype=torch.long)
+        }
+
+
+class CpDataCollator:
+    """
+    Data collator for handling variable-length sequences with padding.
+    """
+
+    def __init__(self, pad_value: float = 0.0, padding_side: str = 'right'):
+        """
+        Initialize the data collator.
+
+        Args:
+            pad_value: Value to use for padding
+            padding_side: 'right' or 'left' padding
+        """
+        self.pad_value = pad_value
+        self.padding_side = padding_side
+
+    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """
+        Collate a batch of sequences.
+
+        Args:
+            batch: List of dictionaries containing 'input_ids' and 'length'
+
+        Returns:
+            Dictionary containing:
+            - input_ids: Padded tensor of shape (batch_size, max_seq_len, input_dim)
+            - attention_mask: Binary mask tensor of shape (batch_size, max_seq_len)
+            - lengths: Original lengths tensor of shape (batch_size,)
+        """
+        # Extract sequences and lengths
+        sequences = [item['input_ids'] for item in batch]
+        lengths = torch.stack([item['length'] for item in batch])
+
+        # Get dimensions
+        max_len = max(seq.shape[0] for seq in sequences)
+        input_dim = sequences[0].shape[1]
+        batch_size = len(sequences)
+
+        # Create padded tensor and attention mask
+        padded_sequences = torch.full((batch_size, max_len, input_dim), self.pad_value)
+        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.float32)
+
+        # Fill in the sequences
+        for i, seq in enumerate(sequences):
+            seq_len = seq.shape[0]
+            if self.padding_side == 'right':
+                padded_sequences[i, :seq_len] = seq
+                attention_mask[i, :seq_len] = 1.0
+            else:  # left padding
+                padded_sequences[i, -seq_len:] = seq
+                attention_mask[i, -seq_len:] = 1.0
+
+        return {
+            'input_ids': padded_sequences,
+            'attention_mask': attention_mask,
+            'lengths': lengths
+        }
 
 
 @cache
@@ -472,7 +629,8 @@ def get_model(config: CpConfig) -> VQVAE:
     Returns:
         VQVAE model instance
     """
-    return VQVAE(
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = VQVAE(
         d1=get_token_dims(),
         d2=config.hidden_dims,
         num_embeddings=config.num_embeddings,
@@ -484,30 +642,32 @@ def get_model(config: CpConfig) -> VQVAE:
         temperature=config.temperature
     )
 
+    model.to(device)
+    model.train()
+    return model
 
-if __name__ == "__main__":
-    config = CpConfig()
-    model = get_model(config)
 
-    # Generate random input
-    x = torch.randn(
-        config.batch_size,
-        128,  # Sequence length
-        get_token_dims()  # Input dimension
+def create_dataloader(config: CpConfig, shuffle: bool = True):
+    """
+    Create a DataLoader with the appropriate collator.
+
+    Args:
+        dataset: CpDataset instance
+        config: Configuration object
+        shuffle: Whether to shuffle the data
+
+    Returns:
+        DataLoader instance
+    """
+
+    files = get_all_xml_paths()
+    dataset = CpDataset(files, max_seq_length=config.max_seq_length, on_too_long='truncate')
+    collator = CpDataCollator(pad_value=0.0)
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        collate_fn=collator,
+        num_workers=4,
+        pin_memory=True
     )
-    print("\n" + "=" * 50)
-    print("dcae-based VQ-VAE:")
-    print("=" * 50)
-
-    # Forward pass with dcae model
-    reconstructed_ce, quantized_ce, vq_loss_ce, perplexity_ce, indices_ce = model(x)
-    losses_ce = model.compute_loss(x, reconstructed_ce, vq_loss_ce)
-
-    print(f"Input shape: {x.shape}")
-    print(f"Quantized shape: {quantized_ce.shape}")
-    print(f"Reconstructed shape: {reconstructed_ce.shape}")
-    print(f"Encoding indices shape: {indices_ce.shape}")
-    print(f"Total loss: {losses_ce['total_loss'].item():.4f}")
-    print(f"Reconstruction loss: {losses_ce['recon_loss'].item():.4f}")
-    print(f"VQ loss: {losses_ce['vq_loss'].item():.4f}")
-    print(f"Perplexity: {perplexity_ce.item():.2f}")

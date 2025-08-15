@@ -12,15 +12,33 @@ CACHE_PATH = "./resources/cache"
 def get_path(root: str, index: str) -> str:
     # Look through the giant-midi-archive directory for the file with the given index like a trie
     # and return the path to that file.
-    path = [root]
+    # Optimization: First try the hardcoded 2-4 digit index, then try the prefix search method
+    target_dir = os.path.join(root, index[:2], index[:4])
+    path = None
+    if os.path.exists(target_dir):
+        if root == MIDI_ROOT:
+            path = os.path.join(target_dir, index + ".mid")
+        elif root == XML_ROOT:
+            path = os.path.join(target_dir, index + ".xml")
+        else:
+            files = os.listdir(target_dir)
+            for file in files:
+                if file.startswith(index):
+                    path = os.path.join(target_dir, file)
+                    break
+
+    if path is not None and os.path.exists(path):
+        return path
+
+    path_dirs = [root]
     while True:
-        p = os.path.join(*path)
+        p = os.path.join(*path_dirs)
         for pt in os.listdir(p):
-            if index.startswith(pt) and os.path.isdir(os.path.join(*path, pt)):
-                path.append(pt)
+            if index.startswith(pt) and os.path.isdir(os.path.join(*path_dirs, pt)):
+                path_dirs.append(pt)
                 break
-            elif pt.startswith(index) and os.path.isfile(os.path.join(*path, pt)):
-                return os.path.join(*path, pt)
+            elif pt.startswith(index) and os.path.isfile(os.path.join(*path_dirs, pt)):
+                return os.path.join(*path_dirs, pt)
         else:
             break
     raise FileNotFoundError(f"File with index {index} not found in {root}.")
