@@ -1,613 +1,551 @@
-# Training script for CP tokenizer
-# python -m src.model.cp_tokenizer_train
+#!/usr/bin/env python3
+"""
+Training script for VQ-VAE model for MIDI tokenization.
+"""
 
+import argparse
 import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.nn.utils import clip_grad_norm_
-import numpy as np
+import sys
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
-import logging
-from tqdm import tqdm
-import wandb
 from datetime import datetime
 import json
+import random
+import numpy as np
 
-# Assuming these imports from your existing code
-from .cp_tokenizer import (
-    CpConfig, CpDataset, get_model, get_token_dims,
-    VQVAE, MultiHeadSelfAttention, TransformerBlock
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.utils.data import DataLoader, random_split
+
+import wandb
+from tqdm import tqdm
+import logging
+from typing import Dict, Optional, Tuple
+
+# Import your model components (adjust import paths as needed)
+from src.model.cp_tokenizer import (
+    CpConfig, VQVAE, CpDataset, CpDataCollator,
+    get_model, create_dataloader, train_step, get_token_dims
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from src.util import get_all_xml_paths
 
 
-@dataclass
-class TrainingConfig:
-    """Configuration for training the CP tokenizer."""
+def setup_logging(log_dir: Path):
+    """Setup logging configuration."""
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Model configuration
-    model_config: CpConfig = field(default_factory=CpConfig)
-
-    # Training hyperparameters
-    learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-6
-    weight_decay: float = 0.01
-    max_epochs: int = 100
-    gradient_clip: float = 1.0
-    warmup_steps: int = 1000
-
-    # Loss weights
-    reconstruction_weight: float = 1.0
-
-    # Data configuration
-    train_data_path: str = "data/train"
-    val_data_path: str = "data/val"
-    num_workers: int = 4
-
-    # Checkpointing
-    checkpoint_dir: str = "checkpoints/cp_tokenizer"
-    save_every_n_epochs: int = 5
-    keep_last_n_checkpoints: int = 3
-
-    # Logging
-    use_wandb: bool = True
-    wandb_project: str = "cp-tokenizer"
-    wandb_run_name: Optional[str] = None
-    log_every_n_steps: int = 10
-    val_every_n_epochs: int = 1
-
-    # Early stopping
-    early_stopping_patience: int = 10
-    early_stopping_min_delta: float = 1e-4
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_dir / 'training.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
 
 
-class AttentionMask:
-    """Utility class for creating attention masks."""
-
-    @staticmethod
-    def create_padding_mask(lengths: torch.Tensor, max_len: int, device: torch.device) -> torch.Tensor:
-        """
-        Create a padding mask for variable length sequences.
-
-        Args:
-            lengths: Tensor of sequence lengths (batch_size,)
-            max_len: Maximum sequence length in the batch
-            device: Device to create the mask on
-
-        Returns:
-            Mask tensor of shape (batch_size, max_len) where True indicates valid positions
-        """
-        batch_size = lengths.size(0)
-        mask = torch.arange(max_len, device=device).expand(batch_size, max_len) < lengths.unsqueeze(1)
-        return mask
+def set_seed(seed: int):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-class CPDataCollator:
-    """Custom data collator for variable-length sequences."""
+def create_train_val_dataloaders(config: CpConfig, val_split: float = 0.1) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create training and validation dataloaders.
 
-    def __init__(self, pad_value: float = 0.0):
-        self.pad_value = pad_value
+    Args:
+        config: Model configuration
+        val_split: Fraction of data to use for validation
 
-    def __call__(self, batch: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Collate batch of variable length sequences.
+    Returns:
+        Tuple of (train_dataloader, val_dataloader)
+    """
+    files = get_all_xml_paths()
+    total_files = len(files)
+    val_size = int(total_files * val_split)
+    train_size = total_files - val_size
 
-        Args:
-            batch: List of tensors with shape (seq_len, input_dim)
+    # Shuffle files and split
+    random.shuffle(files)
+    train_files = files[:train_size]
+    val_files = files[train_size:]
 
-        Returns:
-            Dictionary containing:
-                - input: Padded tensor (batch_size, max_seq_len, input_dim)
-                - attention_mask: Boolean mask (batch_size, max_seq_len)
-                - lengths: Original sequence lengths (batch_size,)
-        """
-        # Get sequence lengths
-        lengths = torch.tensor([x.size(0) for x in batch])
+    # Create datasets
+    train_dataset = CpDataset(train_files, max_seq_length=config.max_seq_length, on_too_long='truncate')
+    val_dataset = CpDataset(val_files, max_seq_length=config.max_seq_length, on_too_long='truncate')
 
-        # Find max length in batch
-        max_len = lengths.max().item()
+    # Create collator
+    collator = CpDataCollator(pad_value=0.0)
 
-        # Get input dimension
-        input_dim = batch[0].size(-1)
+    # Create dataloaders
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
 
-        # Create padded tensor
-        batch_size = len(batch)
-        padded = torch.full((batch_size, max_len, input_dim), self.pad_value)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=4,
+        pin_memory=True
+    )
 
-        # Fill in the sequences
-        for i, seq in enumerate(batch):
-            seq_len = seq.size(0)
-            padded[i, :seq_len] = seq
+    return train_dataloader, val_dataloader
 
-        # Create attention mask
-        attention_mask = AttentionMask.create_padding_mask(lengths, max_len, padded.device)
 
-        return {
-            'input': padded,
-            'attention_mask': attention_mask,
-            'lengths': lengths
+def validate(model: VQVAE, val_dataloader: DataLoader, device: torch.device) -> Dict[str, float]:
+    """
+    Run validation loop.
+
+    Args:
+        model: VQVAE model
+        val_dataloader: Validation dataloader
+        device: Device to run on
+
+    Returns:
+        Dictionary of validation metrics
+    """
+    model.eval()
+    total_loss = 0
+    total_recon_loss = 0
+    total_vq_loss = 0
+    total_perplexity = 0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch in tqdm(val_dataloader, desc="Validation", leave=False):
+            # Move batch to device
+            inputs = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+
+            # Forward pass
+            reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
+
+            # Compute losses
+            losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask)
+
+            # Accumulate metrics
+            total_loss += losses['total_loss'].item()
+            total_recon_loss += losses['recon_loss'].item()
+            total_vq_loss += losses['vq_loss'].item()
+            total_perplexity += perplexity.item()
+            num_batches += 1
+
+    # Compute averages
+    metrics = {
+        'val_loss': total_loss / num_batches,
+        'val_recon_loss': total_recon_loss / num_batches,
+        'val_vq_loss': total_vq_loss / num_batches,
+        'val_perplexity': total_perplexity / num_batches
+    }
+
+    return metrics
+
+
+def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
+                    scheduler: Optional[object], epoch: int,
+                    metrics: Dict[str, float], checkpoint_dir: Path,
+                    is_best: bool = False):
+    """
+    Save model checkpoint.
+
+    Args:
+        model: Model to save
+        optimizer: Optimizer state
+        scheduler: Learning rate scheduler state (optional)
+        epoch: Current epoch
+        metrics: Current metrics
+        checkpoint_dir: Directory to save checkpoints
+        is_best: Whether this is the best model so far
+    """
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'metrics': metrics
+    }
+
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+
+    # Save regular checkpoint
+    checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pt'
+    torch.save(checkpoint, checkpoint_path)
+
+    # Save best model
+    if is_best:
+        best_path = checkpoint_dir / 'best_model.pt'
+        torch.save(checkpoint, best_path)
+
+    # Save latest checkpoint (for resuming)
+    latest_path = checkpoint_dir / 'latest_checkpoint.pt'
+    torch.save(checkpoint, latest_path)
+
+    logging.info(f"Saved checkpoint to {checkpoint_path}")
+
+
+def load_checkpoint(checkpoint_path: Path, model: VQVAE,
+                    optimizer: Optional[torch.optim.Optimizer] = None,
+                    scheduler: Optional[object] = None) -> int:
+    """
+    Load model checkpoint.
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model: Model to load weights into
+        optimizer: Optimizer to load state into (optional)
+        scheduler: Scheduler to load state into (optional)
+
+    Returns:
+        Starting epoch number
+    """
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    logging.info(f"Loaded checkpoint from {checkpoint_path}")
+    return checkpoint.get('epoch', 0) + 1
+
+
+def train(config: CpConfig, args: argparse.Namespace):
+    """
+    Main training loop.
+
+    Args:
+        config: Model configuration
+        args: Command line arguments
+    """
+    # Setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    set_seed(args.seed)
+
+    # Create directories
+    output_dir = Path(args.output_dir)
+    checkpoint_dir = output_dir / 'checkpoints'
+    log_dir = output_dir / 'logs'
+
+    # Setup logging
+    logger = setup_logging(log_dir)
+    logger.info(f"Starting training with config: {config}")
+    logger.info(f"Using device: {device}")
+
+    # Initialize wandb
+    run_name = args.run_name or f"vqvae_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    wandb_config = {
+        **config.__dict__,
+        'run_name': run_name,
+        'learning_rate': args.learning_rate,
+        'num_epochs': args.num_epochs,
+        'val_split': args.val_split,
+        'seed': args.seed,
+        'gradient_clip': args.gradient_clip,
+        'warmup_epochs': args.warmup_epochs,
+        'scheduler': args.scheduler,
+        'beta': args.beta
+    }
+
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=run_name,
+        config=wandb_config,
+        tags=args.wandb_tags.split(',') if args.wandb_tags else None,
+        mode='online' if not args.no_wandb else 'disabled'
+    )
+
+    # Create model
+    model = get_model(config)
+    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Create dataloaders
+    train_dataloader, val_dataloader = create_train_val_dataloaders(config, args.val_split)
+    logger.info(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
+
+    # Create optimizer
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+
+    # Create learning rate scheduler
+    scheduler = None
+    if args.scheduler == 'cosine':
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=args.num_epochs,
+            eta_min=args.learning_rate * 0.01
+        )
+    elif args.scheduler == 'plateau':
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5,
+            verbose=True
+        )
+
+    # Load checkpoint if resuming
+    start_epoch = 0
+    if args.resume_from:
+        start_epoch = load_checkpoint(
+            Path(args.resume_from),
+            model, optimizer, scheduler
+        )
+
+    # Training loop
+    best_val_loss = float('inf')
+    global_step = 0
+
+    for epoch in range(start_epoch, args.num_epochs):
+        epoch_start_time = datetime.now()
+
+        # Training phase
+        model.train()
+        train_losses = {
+            'train_loss': 0,
+            'train_recon_loss': 0,
+            'train_vq_loss': 0,
+            'train_perplexity': 0
         }
+        num_train_batches = 0
 
-
-class VQVAEWithMasking(VQVAE):
-    """Extended VQVAE model with attention masking support."""
-
-    def forward(self, x, attention_mask=None):
-        """
-        Forward pass with optional attention masking.
-
-        Args:
-            x: Input tensor (batch_size, seq_len, input_dim)
-            attention_mask: Boolean mask (batch_size, seq_len)
-
-        Returns:
-            Same as parent class but with masking applied
-        """
-        # Store original mask for reconstruction loss
-        self.current_mask = attention_mask
-
-        # Encode with masking
-        quantized, vq_loss, perplexity, encoding_indices = self.encoder_with_mask(x, attention_mask)
-
-        # Decode with masking
-        reconstructed = self.decoder_with_mask(quantized, attention_mask)
-
-        return reconstructed, quantized, vq_loss, perplexity, encoding_indices
-
-    def encoder_with_mask(self, x, attention_mask=None):
-        """Encoder forward pass with attention masking."""
-        # Project input
-        x = self.encoder.input_projection(x)
-
-        # Apply self-attention blocks with masking
-        for block in self.encoder.attention_blocks:
-            x = self._apply_block_with_mask(block, x, attention_mask)
-
-        # Normalize before quantization
-        x = self.encoder.pre_quant_norm(x)
-
-        # Apply mask before quantization (zero out padding positions)
-        if attention_mask is not None:
-            x = x * attention_mask.unsqueeze(-1)
-
-        # Quantize
-        quantized, vq_loss, perplexity, encoding_indices = self.encoder.quantizer(x)
-
-        return quantized, vq_loss, perplexity, encoding_indices
-
-    def decoder_with_mask(self, x, attention_mask=None):
-        """Decoder forward pass with attention masking."""
-        # Apply self-attention blocks with masking
-        for block in self.decoder.attention_blocks:
-            x = self._apply_block_with_mask(block, x, attention_mask)
-
-        # Project back to original dimension
-        x = self.decoder.output_projection(x)
-
-        return x
-
-    def _apply_block_with_mask(self, block, x, attention_mask=None):
-        """Apply transformer block with optional attention masking."""
-        if attention_mask is None:
-            return block(x)
-
-        # Modify attention computation to include mask
-        # This is a simplified version - you might need to modify the attention module itself
-        # for proper masking implementation
-        batch_size, seq_len, _ = x.shape
-
-        # Apply attention with mask
-        attn_output = block.attention(x)  # This would need modification in actual implementation
-
-        # Apply mask to attention output
-        if attention_mask is not None:
-            attn_output = attn_output * attention_mask.unsqueeze(-1)
-
-        x = block.norm1(x + attn_output)
-
-        # Feed-forward with residual connection
-        ff_output = block.feed_forward(x)
-        if attention_mask is not None:
-            ff_output = ff_output * attention_mask.unsqueeze(-1)
-
-        x = block.norm2(x + ff_output)
-
-        return x
-
-    def compute_loss_with_mask(self, x, reconstructed, vq_loss, attention_mask=None, beta=1.0):
-        """
-        Compute loss with attention masking.
-
-        Args:
-            x: Original input tensor (batch_size, seq_len, input_dim)
-            reconstructed: Reconstructed tensor (batch_size, seq_len, input_dim)
-            vq_loss: Vector quantization loss
-            attention_mask: Boolean mask (batch_size, seq_len)
-            beta: Weight for reconstruction loss
-
-        Returns:
-            Dictionary containing losses
-        """
-        if attention_mask is not None:
-            # Apply mask to both input and reconstruction
-            mask_expanded = attention_mask.unsqueeze(-1).float()
-            x_masked = x * mask_expanded
-            reconstructed_masked = reconstructed * mask_expanded
-
-            # Compute MSE only on valid positions
-            diff = (x_masked - reconstructed_masked) ** 2
-            recon_loss = diff.sum() / mask_expanded.sum()
-        else:
-            recon_loss = F.mse_loss(reconstructed, x)
-
-        # Total loss
-        total_loss = beta * recon_loss + vq_loss
-
-        return {
-            'total_loss': total_loss,
-            'recon_loss': recon_loss,
-            'vq_loss': vq_loss
-        }
-
-
-class Trainer:
-    """Trainer class for VQ-VAE model."""
-
-    def __init__(self, config: TrainingConfig):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # Setup model
-        self.model = self._create_model()
-
-        # Setup data
-        self.train_loader, self.val_loader = self._setup_data()
-
-        # Setup optimizer and scheduler
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
-        )
-
-        total_steps = len(self.train_loader) * config.max_epochs
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=total_steps,
-            eta_min=config.min_learning_rate
-        )
-
-        # Setup logging
-        self._setup_logging()
-
-        # Training state
-        self.epoch = 0
-        self.global_step = 0
-        self.best_val_loss = float('inf')
-        self.patience_counter = 0
-
-    def _create_model(self) -> VQVAEWithMasking:
-        """Create and initialize the model."""
-        base_model = get_model(self.config.model_config)
-
-        # Wrap the model with masking support
-        model = VQVAEWithMasking(
-            d1=get_token_dims(),
-            d2=self.config.model_config.hidden_dims,
-            num_embeddings=self.config.model_config.num_embeddings,
-            n_encoder_blocks=self.config.model_config.n_encoder_blocks,
-            n_decoder_blocks=self.config.model_config.n_decoder_blocks,
-            n_heads=self.config.model_config.n_heads,
-            dropout=self.config.model_config.dropout,
-            use_dcae=self.config.model_config.use_dcae,
-            temperature=self.config.model_config.temperature
-        )
-
-        return model.to(self.device)
-
-    def _setup_data(self):
-        """Setup data loaders."""
-        # Get training files
-        train_files = self._get_files(self.config.train_data_path)
-        val_files = self._get_files(self.config.val_data_path)
-
-        logger.info(f"Found {len(train_files)} training files")
-        logger.info(f"Found {len(val_files)} validation files")
-
-        # Create datasets
-        train_dataset = CpDataset(train_files)
-        val_dataset = CpDataset(val_files)
-
-        # Create data collator
-        collator = CPDataCollator()
-
-        # Create data loaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config.model_config.batch_size,
-            shuffle=True,
-            num_workers=self.config.num_workers,
-            collate_fn=collator,
-            pin_memory=True
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.config.model_config.batch_size,
-            shuffle=False,
-            num_workers=self.config.num_workers,
-            collate_fn=collator,
-            pin_memory=True
-        )
-
-        return train_loader, val_loader
-
-    def _get_files(self, path: str) -> List[str]:
-        """Get all MusicXML files from a directory."""
-        data_path = Path(path)
-        if not data_path.exists():
-            raise ValueError(f"Data path {path} does not exist")
-
-        # Get all XML files recursively
-        files = list(data_path.glob("**/*.xml")) + list(data_path.glob("**/*.musicxml"))
-        return [str(f) for f in files]
-
-    def _setup_logging(self):
-        """Setup logging and wandb."""
-        # Create checkpoint directory
-        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
-
-        # Setup wandb
-        if self.config.use_wandb:
-            run_name = self.config.wandb_run_name or f"cp_tokenizer_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            wandb.init(
-                project=self.config.wandb_project,
-                name=run_name,
-                config=self.config.__dict__
-            )
-
-    def train(self):
-        """Main training loop."""
-        logger.info("Starting training...")
-
-        for epoch in range(self.config.max_epochs):
-            self.epoch = epoch
-
-            # Training epoch
-            train_metrics = self._train_epoch()
-
-            # Validation
-            if (epoch + 1) % self.config.val_every_n_epochs == 0:
-                val_metrics = self._validate()
-
-                # Early stopping check
-                if self._check_early_stopping(val_metrics['total_loss']):
-                    logger.info(f"Early stopping triggered at epoch {epoch}")
-                    break
-
-            # Save checkpoint
-            if (epoch + 1) % self.config.save_every_n_epochs == 0:
-                self._save_checkpoint()
-
-            # Log metrics
-            self._log_metrics(train_metrics, val_metrics if 'val_metrics' in locals() else None)
-
-        logger.info("Training completed!")
-
-        # Save final model
-        self._save_checkpoint(final=True)
-
-    def _train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch."""
-        self.model.train()
-
-        epoch_losses = {
-            'total_loss': 0.0,
-            'recon_loss': 0.0,
-            'vq_loss': 0.0,
-            'perplexity': 0.0
-        }
-
-        progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
 
         for batch_idx, batch in enumerate(progress_bar):
             # Move batch to device
-            inputs = batch['input'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
+            inputs = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+
+            # Learning rate warmup
+            if epoch < args.warmup_epochs:
+                warmup_factor = (epoch * len(train_dataloader) + batch_idx + 1) / (args.warmup_epochs * len(train_dataloader))
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = args.learning_rate * warmup_factor
 
             # Forward pass
-            reconstructed, quantized, vq_loss, perplexity, indices = self.model(inputs, attention_mask)
+            optimizer.zero_grad()
+            reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
 
-            # Compute loss
-            losses = self.model.compute_loss_with_mask(
-                inputs, reconstructed, vq_loss, attention_mask,
-                beta=self.config.reconstruction_weight
-            )
+            # Compute losses with beta weighting
+            losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=args.beta)
 
             # Backward pass
-            self.optimizer.zero_grad()
             losses['total_loss'].backward()
 
             # Gradient clipping
-            clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+            if args.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
 
-            # Optimizer step
-            self.optimizer.step()
-            self.scheduler.step()
+            optimizer.step()
 
-            # Update metrics
-            for key in epoch_losses:
-                if key == 'perplexity':
-                    epoch_losses[key] += perplexity.item()
-                else:
-                    epoch_losses[key] += losses.get(key, 0).item()
+            # Accumulate losses
+            train_losses['train_loss'] += losses['total_loss'].item()
+            train_losses['train_recon_loss'] += losses['recon_loss'].item()
+            train_losses['train_vq_loss'] += losses['vq_loss'].item()
+            train_losses['train_perplexity'] += perplexity.item()
+            num_train_batches += 1
+            global_step += 1
 
             # Update progress bar
             progress_bar.set_postfix({
                 'loss': losses['total_loss'].item(),
                 'recon': losses['recon_loss'].item(),
                 'vq': losses['vq_loss'].item(),
-                'perp': perplexity.item()
+                'ppl': perplexity.item()
             })
 
             # Log to wandb
-            if self.config.use_wandb and batch_idx % self.config.log_every_n_steps == 0:
+            if global_step % args.log_interval == 0:
                 wandb.log({
-                    'train/total_loss': losses['total_loss'].item(),
+                    'train/loss': losses['total_loss'].item(),
                     'train/recon_loss': losses['recon_loss'].item(),
                     'train/vq_loss': losses['vq_loss'].item(),
                     'train/perplexity': perplexity.item(),
-                    'train/learning_rate': self.scheduler.get_last_lr()[0],
-                    'step': self.global_step
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    'global_step': global_step
                 })
 
-            self.global_step += 1
+        # Average training losses
+        for key in train_losses:
+            train_losses[key] /= num_train_batches
 
-        # Average losses
-        num_batches = len(self.train_loader)
-        for key in epoch_losses:
-            epoch_losses[key] /= num_batches
+        # Validation phase
+        val_metrics = validate(model, val_dataloader, device)
 
-        return epoch_losses
+        # Update learning rate scheduler
+        if scheduler is not None:
+            if args.scheduler == 'plateau':
+                scheduler.step(val_metrics['val_loss'])
+            else:
+                scheduler.step()
 
-    def _validate(self) -> Dict[str, float]:
-        """Validate the model."""
-        self.model.eval()
+        # Log epoch metrics
+        epoch_metrics = {**train_losses, **val_metrics}
+        epoch_metrics['epoch'] = epoch + 1
+        epoch_metrics['learning_rate'] = optimizer.param_groups[0]['lr']
 
-        val_losses = {
-            'total_loss': 0.0,
-            'recon_loss': 0.0,
-            'vq_loss': 0.0,
-            'perplexity': 0.0
-        }
+        wandb.log(epoch_metrics)
 
-        with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validation"):
-                # Move batch to device
-                inputs = batch['input'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+        # Check if best model
+        is_best = val_metrics['val_loss'] < best_val_loss
+        if is_best:
+            best_val_loss = val_metrics['val_loss']
+            logger.info(f"New best model! Val loss: {best_val_loss:.4f}")
 
-                # Forward pass
-                reconstructed, quantized, vq_loss, perplexity, indices = self.model(inputs, attention_mask)
-
-                # Compute loss
-                losses = self.model.compute_loss_with_mask(
-                    inputs, reconstructed, vq_loss, attention_mask,
-                    beta=self.config.reconstruction_weight
-                )
-
-                # Update metrics
-                for key in val_losses:
-                    if key == 'perplexity':
-                        val_losses[key] += perplexity.item()
-                    else:
-                        val_losses[key] += losses.get(key, 0).item()
-
-        # Average losses
-        num_batches = len(self.val_loader)
-        for key in val_losses:
-            val_losses[key] /= num_batches
-
-        # Log to wandb
-        if self.config.use_wandb:
-            wandb.log({
-                'val/total_loss': val_losses['total_loss'],
-                'val/recon_loss': val_losses['recon_loss'],
-                'val/vq_loss': val_losses['vq_loss'],
-                'val/perplexity': val_losses['perplexity'],
-                'epoch': self.epoch
-            })
-
-        logger.info(f"Validation - Loss: {val_losses['total_loss']:.4f}, "
-                    f"Recon: {val_losses['recon_loss']:.4f}, "
-                    f"VQ: {val_losses['vq_loss']:.4f}, "
-                    f"Perplexity: {val_losses['perplexity']:.2f}")
-
-        return val_losses
-
-    def _check_early_stopping(self, val_loss: float) -> bool:
-        """Check if early stopping should be triggered."""
-        if val_loss < self.best_val_loss - self.config.early_stopping_min_delta:
-            self.best_val_loss = val_loss
-            self.patience_counter = 0
-
-            # Save best model
-            self._save_checkpoint(best=True)
-        else:
-            self.patience_counter += 1
-
-        return self.patience_counter >= self.config.early_stopping_patience
-
-    def _save_checkpoint(self, best: bool = False, final: bool = False):
-        """Save model checkpoint."""
-        if best:
-            checkpoint_path = os.path.join(self.config.checkpoint_dir, "best_model.pt")
-        elif final:
-            checkpoint_path = os.path.join(self.config.checkpoint_dir, "final_model.pt")
-        else:
-            checkpoint_path = os.path.join(
-                self.config.checkpoint_dir,
-                f"checkpoint_epoch_{self.epoch}.pt"
+        # Save checkpoint
+        if (epoch + 1) % args.save_interval == 0 or is_best:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch + 1,
+                epoch_metrics, checkpoint_dir, is_best
             )
 
-        torch.save({
-            'epoch': self.epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
-            'config': self.config.__dict__
-        }, checkpoint_path)
+        # Log epoch summary
+        epoch_time = (datetime.now() - epoch_start_time).total_seconds()
+        logger.info(
+            f"Epoch {epoch+1}/{args.num_epochs} - "
+            f"Train Loss: {train_losses['train_loss']:.4f}, "
+            f"Val Loss: {val_metrics['val_loss']:.4f}, "
+            f"Val Perplexity: {val_metrics['val_perplexity']:.2f}, "
+            f"Time: {epoch_time:.1f}s"
+        )
 
-        logger.info(f"Saved checkpoint to {checkpoint_path}")
+        # Early stopping check
+        if args.early_stopping_patience > 0:
+            if epoch - best_val_loss > args.early_stopping_patience:
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                break
 
-        # Clean up old checkpoints
-        if not best and not final:
-            self._cleanup_checkpoints()
+    # Final save
+    save_checkpoint(
+        model, optimizer, scheduler, args.num_epochs,
+        epoch_metrics, checkpoint_dir, is_best=False
+    )
 
-    def _cleanup_checkpoints(self):
-        """Remove old checkpoints, keeping only the last N."""
-        checkpoint_files = sorted([
-            f for f in os.listdir(self.config.checkpoint_dir)
-            if f.startswith('checkpoint_epoch_')
-        ])
+    # Close wandb
+    wandb.finish()
 
-        if len(checkpoint_files) > self.config.keep_last_n_checkpoints:
-            for f in checkpoint_files[:-self.config.keep_last_n_checkpoints]:
-                os.remove(os.path.join(self.config.checkpoint_dir, f))
-
-    def _log_metrics(self, train_metrics: Dict[str, float], val_metrics: Optional[Dict[str, float]] = None):
-        """Log metrics to console."""
-        log_str = f"Epoch {self.epoch} - Train Loss: {train_metrics['total_loss']:.4f}"
-        if val_metrics:
-            log_str += f", Val Loss: {val_metrics['total_loss']:.4f}"
-        logger.info(log_str)
+    logger.info("Training completed!")
 
 
 def main():
-    """Main training entry point."""
-    # Parse arguments (you can add argparse here if needed)
-    config = TrainingConfig()
+    parser = argparse.ArgumentParser(description="Train VQ-VAE model for MIDI tokenization")
 
-    # Create trainer
-    trainer = Trainer(config)
+    # Model configuration
+    parser.add_argument('--hidden_dims', type=int, default=512,
+                        help='Hidden dimension size')
+    parser.add_argument('--num_embeddings', type=int, default=8192,
+                        help='Number of codebook entries')
+    parser.add_argument('--n_heads', type=int, default=8,
+                        help='Number of attention heads')
+    parser.add_argument('--n_encoder_blocks', type=int, default=8,
+                        help='Number of encoder blocks')
+    parser.add_argument('--n_decoder_blocks', type=int, default=8,
+                        help='Number of decoder blocks')
+    parser.add_argument('--use_dcae', action='store_true',
+                        help='Use DCAE for vector quantization')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='Temperature for DCAE')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout rate')
 
-    # Start training
-    trainer.train()
+    # Training configuration
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size')
+    parser.add_argument('--max_seq_length', type=int, default=2048,
+                        help='Maximum sequence length')
+    parser.add_argument('--num_epochs', type=int, default=100,
+                        help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
+                        help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='Weight decay')
+    parser.add_argument('--gradient_clip', type=float, default=1.0,
+                        help='Gradient clipping value')
+    parser.add_argument('--beta', type=float, default=1.0,
+                        help='Weight for reconstruction loss')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='Number of warmup epochs')
+    parser.add_argument('--scheduler', type=str, default='cosine',
+                        choices=['none', 'cosine', 'plateau'],
+                        help='Learning rate scheduler')
 
-    # Close wandb
-    if config.use_wandb:
-        wandb.finish()
+    # Data configuration
+    parser.add_argument('--val_split', type=float, default=0.1,
+                        help='Validation split fraction')
+
+    # Logging configuration
+    parser.add_argument('--output_dir', type=str, default='outputs/vqvae',
+                        help='Output directory')
+    parser.add_argument('--log_interval', type=int, default=10,
+                        help='Logging interval (steps)')
+    parser.add_argument('--save_interval', type=int, default=5,
+                        help='Checkpoint save interval (epochs)')
+
+    # Wandb configuration
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Wandb run name')
+    parser.add_argument('--wandb_project', type=str, default='vqvae-midi',
+                        help='Wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                        help='Wandb entity')
+    parser.add_argument('--wandb_tags', type=str, default=None,
+                        help='Wandb tags (comma-separated)')
+    parser.add_argument('--no_wandb', action='store_true',
+                        help='Disable wandb logging')
+
+    # Other configuration
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='Resume from checkpoint')
+    parser.add_argument('--early_stopping_patience', type=int, default=0,
+                        help='Early stopping patience (0 to disable)')
+
+    args = parser.parse_args()
+
+    # Create configuration
+    config = CpConfig(
+        hidden_dims=args.hidden_dims,
+        num_embeddings=args.num_embeddings,
+        n_heads=args.n_heads,
+        n_encoder_blocks=args.n_encoder_blocks,
+        n_decoder_blocks=args.n_decoder_blocks,
+        use_dcae=args.use_dcae,
+        dropout=args.dropout,
+        temperature=args.temperature,
+        batch_size=args.batch_size,
+        max_seq_length=args.max_seq_length
+    )
+
+    # Run training
+    train(config, args)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
