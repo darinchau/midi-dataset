@@ -15,7 +15,9 @@ import logging
 from functools import cache
 from tqdm import tqdm
 from ..extract import musicxml_to_notes
-from ..extract.tokenize import musicxml_to_tokens
+from ..extract.tokenize import notes_to_tokens
+from ..constants import XML_ROOT
+from ..util import get_path
 
 
 @dataclass(frozen=True)
@@ -23,15 +25,38 @@ class CpConfig:
     """
     Configuration for CP tokenizer training.
     """
-    input_dim: int = 512
+    # The latent dimension of the model
+    hidden_dims: int = 512
+
+    # The number of codebook entries
+    num_embeddings: int = 8192
+
+    # Number of attention heads
+    n_heads: int = 8
+
+    # Number of encoder blocks
+    n_encoder_blocks: int = 8
+
+    # Number of decoder blocks
+    n_decoder_blocks: int = 8
+
+    # Whether to use DCAE https://arxiv.org/abs/2504.00496
+    use_dcae: bool = False
+
+    # Dropout rate for attention and feed-forward layers
+    dropout: float = 0.1
+
+    # Temperature for softmax in DCAE
+    temperature: float = 1.0
+
+    # Batch size for training
+    batch_size: int = 32
 
 
 class VectorQuantizer(nn.Module):
     """
     Vector Quantization layer that maps continuous representations to discrete codes.
     Supports both L2 distance and DCAE.
-
-    https://arxiv.org/abs/2504.00496
     """
 
     def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25,
@@ -48,7 +73,7 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
 
         if use_dcae:
-            # Additional projections for cross-entropy based assignment
+            # Additional projections for dcae based assignment
             self.query_proj = nn.Linear(embedding_dim, embedding_dim)
             self.key_proj = nn.Linear(embedding_dim, embedding_dim)
             # Learnable temperature parameter
@@ -62,7 +87,7 @@ class VectorQuantizer(nn.Module):
         flat_input = inputs.view(-1, self.embedding_dim)
 
         if self.use_dcae:
-            # Cross-entropy based assignment (similarity-based)
+            # dcae based assignment (similarity-based)
             # Project inputs and codebook to query and key spaces
             queries = self.query_proj(flat_input)  # (batch*seq, embedding_dim)
             keys = self.key_proj(self.embedding.weight)  # (num_embeddings, embedding_dim)
@@ -223,7 +248,7 @@ class VQVAEEncoder(nn.Module):
     """
 
     def __init__(self, d1, d2, num_embeddings, n_attention_blocks=3, n_heads=8,
-                 dropout=0.1, use_cross_entropy=False, temperature=1.0):
+                 dropout=0.1, use_dcae=False, temperature=1.0):
         super().__init__()
 
         # Initial projection
@@ -238,10 +263,10 @@ class VQVAEEncoder(nn.Module):
         # Pre-quantization normalization
         self.pre_quant_norm = nn.LayerNorm(d2)
 
-        # Vector quantization with cross-entropy option
+        # Vector quantization with dcae option
         self.quantizer = VectorQuantizer(
             num_embeddings, d2,
-            use_dcae=use_cross_entropy,
+            use_dcae=use_dcae,
             temperature=temperature
         )
 
@@ -296,12 +321,12 @@ class VQVAEDecoder(nn.Module):
 class VQVAE(nn.Module):
     """
     Complete VQ-VAE model with encoder and decoder.
-    Supports both L2 distance and cross-entropy based vector quantization.
+    Supports both L2 distance and dcae based vector quantization.
     """
 
     def __init__(self, d1, d2, num_embeddings, n_encoder_blocks=3, n_decoder_blocks=3,
                  n_heads=8, dropout=0.1, commitment_cost=0.25,
-                 use_cross_entropy=False, temperature=1.0):
+                 use_dcae=False, temperature=1.0):
         super().__init__()
 
         self.encoder = VQVAEEncoder(
@@ -309,7 +334,7 @@ class VQVAE(nn.Module):
             n_attention_blocks=n_encoder_blocks,
             n_heads=n_heads,
             dropout=dropout,
-            use_cross_entropy=use_cross_entropy,
+            use_dcae=use_dcae,
             temperature=temperature
         )
 
@@ -322,7 +347,7 @@ class VQVAE(nn.Module):
 
         # Store commitment cost for loss calculation
         self.commitment_cost = commitment_cost
-        self.use_cross_entropy = use_cross_entropy
+        self.use_dcae = use_dcae
 
     def forward(self, x):
         # Encode and quantize
@@ -425,7 +450,7 @@ class CpDataset(Dataset):
 def get_token_dims():
     """Get the input dimension of the tokenized data"""
     from ..test import BACH_C_MAJOR_PRELUDE
-    tokens = musicxml_to_tokens(musicxml_to_notes(BACH_C_MAJOR_PRELUDE))
+    tokens = notes_to_tokens(musicxml_to_notes(get_path(XML_ROOT, BACH_C_MAJOR_PRELUDE)))
     return tokens.shape[-1]
 
 
@@ -433,8 +458,59 @@ def load_musicxml_tokens(file_path: str) -> np.ndarray:
     """Load and tokenize MusicXML file"""
     try:
         notes = musicxml_to_notes(file_path)
-        tokens = musicxml_to_tokens(notes)
+        tokens = notes_to_tokens(notes)
         return tokens
     except Exception as e:
         logging.error(f"Error loading {file_path}: {e}")
         return np.array([]).reshape(0, get_token_dims())
+
+
+def get_model(config: CpConfig) -> VQVAE:
+    """
+    Create a VQ-VAE model with the given configuration.
+
+    Args:
+        config: Configuration object containing model parameters
+
+    Returns:
+        VQVAE model instance
+    """
+    return VQVAE(
+        d1=get_token_dims(),
+        d2=config.hidden_dims,
+        num_embeddings=config.num_embeddings,
+        n_encoder_blocks=config.n_encoder_blocks,
+        n_decoder_blocks=config.n_decoder_blocks,
+        n_heads=config.n_heads,
+        dropout=config.dropout,
+        use_dcae=config.use_dcae,
+        temperature=config.temperature
+    )
+
+
+if __name__ == "__main__":
+    config = CpConfig()
+    model = get_model(config)
+
+    # Generate random input
+    x = torch.randn(
+        config.batch_size,
+        128,  # Sequence length
+        get_token_dims()  # Input dimension
+    )
+    print("\n" + "=" * 50)
+    print("dcae-based VQ-VAE:")
+    print("=" * 50)
+
+    # Forward pass with dcae model
+    reconstructed_ce, quantized_ce, vq_loss_ce, perplexity_ce, indices_ce = model(x)
+    losses_ce = model.compute_loss(x, reconstructed_ce, vq_loss_ce)
+
+    print(f"Input shape: {x.shape}")
+    print(f"Quantized shape: {quantized_ce.shape}")
+    print(f"Reconstructed shape: {reconstructed_ce.shape}")
+    print(f"Encoding indices shape: {indices_ce.shape}")
+    print(f"Total loss: {losses_ce['total_loss'].item():.4f}")
+    print(f"Reconstruction loss: {losses_ce['recon_loss'].item():.4f}")
+    print(f"VQ loss: {losses_ce['vq_loss'].item():.4f}")
+    print(f"Perplexity: {perplexity_ce.item():.2f}")

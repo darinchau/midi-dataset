@@ -30,7 +30,7 @@ def element_to_nparray(element: MusicXMLNote):
     return v
 
 
-def musicxml_to_tokens(notes_data: list[MusicXMLNote]):
+def notes_to_tokens(notes_data: list[MusicXMLNote]):
     """
     Tokenize a list of MusicXMLNote objects into a one-hot encoded 3D piano roll.
 
