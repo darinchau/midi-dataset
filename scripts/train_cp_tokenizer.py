@@ -1,5 +1,5 @@
 """
-Training script for VQ-VAE model for MIDI tokenization.
+Training script for VQ-VAE model for MIDI tokenization with HF Accelerate support.
 """
 from __future__ import annotations
 import argparse
@@ -18,6 +18,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
+
+# Import Accelerate
+from accelerate import Accelerator
+from accelerate.utils import set_seed as accelerate_set_seed
 
 import wandb
 from tqdm import tqdm
@@ -68,6 +72,9 @@ class TrainingConfig:
     wandb_entity: Optional[str]
     wandb_tags: Optional[List[str]]
     no_wandb: bool
+
+    # Accelerate configuration
+    mixed_precision: str  # Options: 'no', 'fp16', 'bf16'
 
     # Other configuration
     seed: int
@@ -130,6 +137,7 @@ class TrainingConfig:
             wandb_entity=args.wandb_entity,
             wandb_tags=wandb_tags,
             no_wandb=args.no_wandb,
+            mixed_precision=args.mixed_precision,
             seed=args.seed,
             resume_from=args.resume_from,
             early_stopping_patience=args.early_stopping_patience,
@@ -148,18 +156,23 @@ class TrainingConfig:
         return cls(**config_dict)
 
 
-def setup_logging(log_dir: Path):
+def setup_logging(log_dir: Path, accelerator: Accelerator):
     """Setup logging configuration."""
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_dir / 'training.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
+    # Only log on main process
+    if accelerator.is_main_process:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_dir / 'training.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+    else:
+        logging.basicConfig(level=logging.ERROR)
+
     return logging.getLogger(__name__)
 
 
@@ -235,14 +248,14 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
     return train_dataloader, val_dataloader
 
 
-def validate(model: VQVAE, val_dataloader: DataLoader, device: torch.device) -> Dict[str, float]:
+def validate(model: VQVAE, val_dataloader: DataLoader, accelerator: Accelerator) -> Dict[str, float]:
     """
     Run validation loop.
 
     Args:
         model: VQVAE model
         val_dataloader: Validation dataloader
-        device: Device to run on
+        accelerator: Accelerator instance
 
     Returns:
         Dictionary of validation metrics
@@ -255,10 +268,10 @@ def validate(model: VQVAE, val_dataloader: DataLoader, device: torch.device) -> 
     num_batches = 0
 
     with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc="Validation", leave=False):
-            # Move batch to device
-            inputs = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+        for batch in tqdm(val_dataloader, desc="Validation", leave=False, disable=not accelerator.is_local_main_process):
+            # No need to move to device, accelerator handles it
+            inputs = batch['input_ids']
+            attention_mask = batch['attention_mask']
 
             # Forward pass
             reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
@@ -266,11 +279,19 @@ def validate(model: VQVAE, val_dataloader: DataLoader, device: torch.device) -> 
             # Compute losses
             losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask)
 
+            # Gather losses across all processes
+            losses_gathered = accelerator.gather_for_metrics({
+                'total_loss': losses['total_loss'],
+                'recon_loss': losses['recon_loss'],
+                'vq_loss': losses['vq_loss'],
+                'perplexity': perplexity
+            })
+
             # Accumulate metrics
-            total_loss += losses['total_loss'].item()
-            total_recon_loss += losses['recon_loss'].item()
-            total_vq_loss += losses['vq_loss'].item()
-            total_perplexity += perplexity.item()
+            total_loss += losses_gathered['total_loss'].mean().item()
+            total_recon_loss += losses_gathered['recon_loss'].mean().item()
+            total_vq_loss += losses_gathered['vq_loss'].mean().item()
+            total_perplexity += losses_gathered['perplexity'].mean().item()
             num_batches += 1
 
     # Compute averages
@@ -287,7 +308,8 @@ def validate(model: VQVAE, val_dataloader: DataLoader, device: torch.device) -> 
 def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
                     scheduler, epoch: int,
                     metrics: Dict[str, float], checkpoint_dir: Path,
-                    config: TrainingConfig, is_best: bool = False):
+                    config: TrainingConfig, accelerator: Accelerator,
+                    is_best: bool = False):
     """
     Save model checkpoint.
 
@@ -299,13 +321,21 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
         metrics: Current metrics
         checkpoint_dir: Directory to save checkpoints
         config: Training configuration
+        accelerator: Accelerator instance
         is_best: Whether this is the best model so far
     """
+    # Only save on main process
+    if not accelerator.is_main_process:
+        return
+
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Unwrap model if wrapped by accelerator
+    unwrapped_model = accelerator.unwrap_model(model)
 
     checkpoint = {
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': unwrapped_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'metrics': metrics,
         'config': config.to_dict()
@@ -316,16 +346,16 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
 
     # Save regular checkpoint
     checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pt'
-    torch.save(checkpoint, checkpoint_path)
+    accelerator.save(checkpoint, checkpoint_path)
 
     # Save best model
     if is_best:
         best_path = checkpoint_dir / 'best_model.pt'
-        torch.save(checkpoint, best_path)
+        accelerator.save(checkpoint, best_path)
 
     # Save latest checkpoint (for resuming)
     latest_path = checkpoint_dir / 'latest_checkpoint.pt'
-    torch.save(checkpoint, latest_path)
+    accelerator.save(checkpoint, latest_path)
 
     # Save config alongside checkpoint
     config.save(checkpoint_dir / 'config.json')
@@ -335,7 +365,7 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
 
 def load_checkpoint(checkpoint_path: Path, model: VQVAE,
                     optimizer: Optional[torch.optim.Optimizer] = None,
-                    scheduler=None) -> int:
+                    scheduler=None, accelerator: Accelerator = None) -> int:
     """
     Load model checkpoint.
 
@@ -344,12 +374,19 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
         model: Model to load weights into
         optimizer: Optimizer to load state into (optional)
         scheduler: Scheduler to load state into (optional)
+        accelerator: Accelerator instance
 
     Returns:
         Starting epoch number
     """
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+    # Unwrap model if using accelerator
+    if accelerator:
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
 
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -363,51 +400,68 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
 
 def train(config: TrainingConfig):
     """
-    Main training loop.
+    Main training loop with Accelerate support.
 
     Args:
         config: Training configuration containing all hyperparameters
     """
+    # Initialize accelerator with mixed precision
+    accelerator = Accelerator(
+        mixed_precision=config.mixed_precision,
+        gradient_accumulation_steps=config.grad_accumulation_steps,
+        log_with="wandb" if not config.no_wandb else None,
+        project_dir=config.output_dir
+    )
+
     # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    set_seed(config.seed)
+    accelerate_set_seed(config.seed)
 
     # Create directories
     output_dir = Path(config.output_dir)
     checkpoint_dir = output_dir / 'checkpoints'
     log_dir = output_dir / 'logs'
 
-    # Setup logging
-    logger = setup_logging(log_dir)
-    logger.info(f"Starting training with config:")
-    logger.info(json.dumps(config.to_dict(), indent=2))
-    logger.info(f"Using device: {device}")
+    # Setup logging (only on main process)
+    logger = setup_logging(log_dir, accelerator)
 
-    # Save config
-    output_dir.mkdir(parents=True, exist_ok=True)
-    config.save(output_dir / 'config.json')
+    if accelerator.is_main_process:
+        logger.info(f"Starting training with config:")
+        logger.info(json.dumps(config.to_dict(), indent=2))
+        logger.info(f"Using device: {accelerator.device}")
+        logger.info(f"Mixed precision: {config.mixed_precision}")
+        logger.info(f"Num processes: {accelerator.num_processes}")
 
-    # Initialize wandb
-    # Add run_name to wandb config
-    wandb_config = config.to_dict()
+        # Save config
+        output_dir.mkdir(parents=True, exist_ok=True)
+        config.save(output_dir / 'config.json')
 
-    wandb.init(
-        project=config.wandb_project,
-        entity=config.wandb_entity,
-        name=config.run_name,
-        config=wandb_config,
-        tags=config.wandb_tags,
-        mode='online' if not config.no_wandb else 'disabled'
-    )
+    # Initialize wandb through accelerator
+    if not config.no_wandb:
+        wandb_config = config.to_dict()
+        accelerator.init_trackers(
+            project_name=config.wandb_project,
+            config=wandb_config,
+            init_kwargs={
+                "wandb": {
+                    "entity": config.wandb_entity,
+                    "name": config.run_name,
+                    "tags": config.wandb_tags,
+                }
+            }
+        )
 
     # Create model
     cp_config = config.to_cp_config()
     model = get_model(cp_config)
-    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    if accelerator.is_main_process:
+        logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Create dataloaders
     train_dataloader, val_dataloader = create_train_val_dataloaders(config)
-    logger.info(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
+
+    if accelerator.is_main_process:
+        logger.info(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
 
     # Create optimizer
     optimizer = optim.AdamW(
@@ -434,12 +488,21 @@ def train(config: TrainingConfig):
             patience=5,
         )
 
+    # Prepare everything with accelerator
+    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader
+    )
+
+    if scheduler is not None and config.scheduler != 'plateau':
+        # Only prepare non-ReduceLROnPlateau schedulers
+        scheduler = accelerator.prepare(scheduler)
+
     # Load checkpoint if resuming
     start_epoch = 0
     if config.resume_from:
         start_epoch = load_checkpoint(
             Path(config.resume_from),
-            model, optimizer, scheduler
+            model, optimizer, scheduler, accelerator
         )
 
     # Training loop
@@ -461,12 +524,16 @@ def train(config: TrainingConfig):
         }
         num_train_batches = 0
 
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
+        progress_bar = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch+1}/{config.num_epochs}",
+            disable=not accelerator.is_local_main_process
+        )
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Move batch to device
-            inputs = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+            # Accelerator handles device placement
+            inputs = batch['input_ids']
+            attention_mask = batch['attention_mask']
 
             # Learning rate warmup
             if epoch < config.warmup_epochs:
@@ -474,17 +541,23 @@ def train(config: TrainingConfig):
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = config.learning_rate * warmup_factor
 
-            # Forward pass
-            reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
+            # Use accelerator's accumulate context manager
+            with accelerator.accumulate(model):
+                # Forward pass
+                reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
 
-            # Compute losses with beta weighting
-            losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
+                # Compute losses with beta weighting
+                losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
 
-            # Scale loss by gradient accumulation steps
-            loss = losses['total_loss'] / config.grad_accumulation_steps
+                # Backward pass (accelerator handles scaling)
+                accelerator.backward(losses['total_loss'])
 
-            # Backward pass
-            loss.backward()
+                # Gradient clipping
+                if config.gradient_clip > 0 and accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+
+                optimizer.step()
+                optimizer.zero_grad()
 
             # Accumulate losses
             train_losses['train_loss'] += losses['total_loss'].item()
@@ -493,27 +566,22 @@ def train(config: TrainingConfig):
             train_losses['train_perplexity'] += perplexity.item()
             num_train_batches += 1
 
-            # Update weights every grad_accumulation_steps
-            if (batch_idx + 1) % config.grad_accumulation_steps == 0:
-                # Gradient clipping
-                if config.gradient_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
-
-                optimizer.step()
-                optimizer.zero_grad()
+            # Update global step
+            if accelerator.sync_gradients:
                 global_step += 1
 
             # Update progress bar
-            progress_bar.set_postfix({
-                'loss': losses['total_loss'].item(),
-                'recon': losses['recon_loss'].item(),
-                'vq': losses['vq_loss'].item(),
-                'ppl': perplexity.item()
-            })
+            if accelerator.is_local_main_process:
+                progress_bar.set_postfix({
+                    'loss': losses['total_loss'].item(),
+                    'recon': losses['recon_loss'].item(),
+                    'vq': losses['vq_loss'].item(),
+                    'ppl': perplexity.item()
+                })
 
             # Log to wandb
-            if global_step % config.log_interval == 0:
-                wandb.log({
+            if global_step % config.log_interval == 0 and accelerator.is_main_process:
+                accelerator.log({
                     'train/loss': losses['total_loss'].item(),
                     'train/recon_loss': losses['recon_loss'].item(),
                     'train/vq_loss': losses['vq_loss'].item(),
@@ -527,7 +595,7 @@ def train(config: TrainingConfig):
             train_losses[key] /= num_train_batches
 
         # Validation phase
-        val_metrics = validate(model, val_dataloader, device)
+        val_metrics = validate(model, val_dataloader, accelerator)
 
         # Update learning rate scheduler
         if scheduler is not None:
@@ -541,50 +609,57 @@ def train(config: TrainingConfig):
         epoch_metrics['epoch'] = epoch + 1
         epoch_metrics['learning_rate'] = optimizer.param_groups[0]['lr']
 
-        wandb.log(epoch_metrics)
+        if accelerator.is_main_process:
+            accelerator.log(epoch_metrics)
 
         # Check if best model
         is_best = val_metrics['val_loss'] < best_val_loss
         if is_best:
             best_val_loss = val_metrics['val_loss']
             epochs_without_improvement = 0
-            logger.info(f"New best model! Val loss: {best_val_loss:.4f}")
+            if accelerator.is_main_process:
+                logger.info(f"New best model! Val loss: {best_val_loss:.4f}")
         else:
             epochs_without_improvement += 1
 
         # Save checkpoint
         if (epoch + 1) % config.save_interval == 0 or is_best:
+            accelerator.wait_for_everyone()
             save_checkpoint(
                 model, optimizer, scheduler, epoch + 1,
-                epoch_metrics, checkpoint_dir, config, is_best
+                epoch_metrics, checkpoint_dir, config, accelerator, is_best
             )
 
         # Log epoch summary
-        epoch_time = (datetime.now() - epoch_start_time).total_seconds()
-        logger.info(
-            f"Epoch {epoch+1}/{config.num_epochs} - "
-            f"Train Loss: {train_losses['train_loss']:.4f}, "
-            f"Val Loss: {val_metrics['val_loss']:.4f}, "
-            f"Val Perplexity: {val_metrics['val_perplexity']:.2f}, "
-            f"Time: {epoch_time:.1f}s"
-        )
+        if accelerator.is_main_process:
+            epoch_time = (datetime.now() - epoch_start_time).total_seconds()
+            logger.info(
+                f"Epoch {epoch+1}/{config.num_epochs} - "
+                f"Train Loss: {train_losses['train_loss']:.4f}, "
+                f"Val Loss: {val_metrics['val_loss']:.4f}, "
+                f"Val Perplexity: {val_metrics['val_perplexity']:.2f}, "
+                f"Time: {epoch_time:.1f}s"
+            )
 
         # Early stopping check
         if config.early_stopping_patience > 0:
             if epochs_without_improvement >= config.early_stopping_patience:
-                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                if accelerator.is_main_process:
+                    logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                 break
 
     # Final save
+    accelerator.wait_for_everyone()
     save_checkpoint(
         model, optimizer, scheduler, config.num_epochs,
-        epoch_metrics, checkpoint_dir, config, is_best=False
+        epoch_metrics, checkpoint_dir, config, accelerator, is_best=False
     )
 
-    # Close wandb
-    wandb.finish()
+    # End tracking
+    accelerator.end_training()
 
-    logger.info("Training completed!")
+    if accelerator.is_main_process:
+        logger.info("Training completed!")
 
 
 def main():
@@ -656,6 +731,11 @@ def main():
                         help='Wandb tags (comma-separated)')
     parser.add_argument('--no_wandb', action='store_true',
                         help='Disable wandb logging')
+
+    # Accelerate configuration
+    parser.add_argument('--mixed_precision', type=str, default='fp16',
+                        choices=['no', 'fp16', 'bf16'],
+                        help='Mixed precision training mode')
 
     # Other configuration
     parser.add_argument('--seed', type=int, default=42,
