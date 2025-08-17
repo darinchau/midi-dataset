@@ -2,7 +2,7 @@ import os
 import pandas as pd
 from functools import cache
 from xml.etree.ElementTree import Element
-from .constants import METADATA_PATH, MIDI_ROOT, XML_ROOT
+from ..constants import METADATA_PATH, MIDI_ROOT, XML_ROOT
 import pickle
 from tqdm.auto import tqdm
 
@@ -63,7 +63,7 @@ def iterate_xmls(check: bool = True):
     """Iterate through all XML files in the dataset.
     If `check` is True, it will validate each XML file using `is_valid_xml`.
     """
-    from .extract.analyze import is_valid_xml
+    from ..extract.analyze import is_valid_xml
     for path in iterate_dataset(XML_ROOT):
         if check:
             if is_valid_xml(path):

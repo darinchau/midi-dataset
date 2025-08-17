@@ -1,7 +1,7 @@
 # Tokenizes MIDI compound words (cp) into discrete tokens
 
 from torch.utils.data import DataLoader
-from ..util import get_all_xml_paths
+from ..utils import get_all_xml_paths
 import os
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Union
 from ..extract import musicxml_to_notes
 from ..extract.tokenize import notes_to_tokens
 from ..constants import XML_ROOT
-from ..util import get_path
+from ..utils import get_path
 
 MASKED_VALUE = -1e+4
 
@@ -647,7 +647,7 @@ def load_musicxml_tokens(file_path: str) -> np.ndarray:
         return np.array([]).reshape(0, get_token_dims())
 
 
-def get_model(config: CpConfig) -> VQVAE:
+def get_model(config: CpConfig | None = None) -> VQVAE:
     """
     Create a VQ-VAE model with the given configuration.
 
@@ -657,7 +657,8 @@ def get_model(config: CpConfig) -> VQVAE:
     Returns:
         VQVAE model instance
     """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if config is None:
+        config = CpConfig()
     model = VQVAE(
         d1=get_token_dims(),
         d2=config.hidden_dims,
@@ -670,9 +671,6 @@ def get_model(config: CpConfig) -> VQVAE:
         temperature=config.temperature,
         use_checkpoint=config.use_checkpoint
     )
-
-    model.to(device)
-    model.train()
     return model
 
 

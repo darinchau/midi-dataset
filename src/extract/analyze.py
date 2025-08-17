@@ -4,7 +4,7 @@ import xml.etree.ElementTree as ET
 import logging
 from dataclasses import dataclass
 from typing import List
-from ..util import get_text_or_raise, get_inv_gm_instruments_map, dynamics_to_velocity, get_time_signature_map
+from ..utils import get_text_or_raise, get_inv_gm_instruments_map, dynamics_to_velocity, get_time_signature_map
 
 logger = logging.getLogger(__name__)
 

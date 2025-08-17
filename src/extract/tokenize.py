@@ -6,8 +6,8 @@ import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import Element
 from dataclasses import dataclass
 from .analyze import MusicXMLNote
-from ..util import get_time_signature_map
-from ..util import get_inv_time_signature_map,  get_text_or_raise, dynamics_to_velocity
+from ..utils import get_time_signature_map
+from ..utils import get_inv_time_signature_map,  get_text_or_raise, dynamics_to_velocity
 
 
 def element_to_nparray(element: MusicXMLNote):

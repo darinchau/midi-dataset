@@ -203,7 +203,7 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
     Returns:
         Tuple of (train_dataloader, val_dataloader)
     """
-    from src.util import get_all_xml_paths
+    from src.utils import get_all_xml_paths
 
     files = get_all_xml_paths()
     total_files = len(files)
@@ -451,7 +451,7 @@ def train(config: TrainingConfig):
     checkpoint_dir = output_dir / 'checkpoints'
     log_dir = output_dir / 'logs'
 
-    # Setup logging (only on main process)
+    # Setup logging
     logger = setup_logging(log_dir, accelerator)
 
     if accelerator.is_main_process:
@@ -483,6 +483,8 @@ def train(config: TrainingConfig):
     # Create model
     cp_config = config.to_cp_config()
     model = get_model(cp_config)
+    model.to(accelerator.device)
+    model.train()
 
     if accelerator.is_main_process:
         logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -656,7 +658,7 @@ def train(config: TrainingConfig):
             epochs_without_improvement += 1
 
         # Save checkpoint
-        if (epoch + 1) % config.save_interval == 0 or is_best:
+        if (global_step + 1) % config.save_interval == 0 or is_best:
             accelerator.wait_for_everyone()
             save_checkpoint(
                 model, optimizer, scheduler, epoch + 1, global_step,
@@ -754,8 +756,8 @@ def main():
                         help='Output directory')
     parser.add_argument('--log_interval', type=int, default=10,
                         help='Logging interval (steps)')
-    parser.add_argument('--save_interval', type=int, default=5,
-                        help='Checkpoint save interval (epochs)')
+    parser.add_argument('--save_interval', type=int, default=5000,
+                        help='Checkpoint save interval (steps)')
 
     # Wandb configuration
     parser.add_argument('--run_name', type=str, default=None,
