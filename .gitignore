@@ -89,3 +89,4 @@ data
 *.zip
 logs.txt
 resources/cache
+outputs/*
