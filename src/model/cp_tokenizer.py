@@ -19,6 +19,8 @@ from ..extract.tokenize import notes_to_tokens
 from ..constants import XML_ROOT
 from ..util import get_path
 
+MASKED_VALUE = -1e+4
+
 
 @dataclass(frozen=True)
 class CpConfig:
@@ -110,7 +112,7 @@ class VectorQuantizer(nn.Module):
             similarity_scores = torch.matmul(queries, keys.t()) / self.temperature_param
 
             # Mask invalid positions
-            similarity_scores = similarity_scores.masked_fill(~flat_mask, -1e9)
+            similarity_scores = similarity_scores.masked_fill(~flat_mask, MASKED_VALUE)
 
             # Get assignments using softmax (soft assignment during training)
             attention_weights = F.softmax(similarity_scores, dim=-1)
@@ -253,7 +255,7 @@ class MultiHeadSelfAttention(nn.Module):
             # Expand mask for all heads
             mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq_len)
             mask = mask.expand(-1, self.n_heads, seq_len, -1)  # (batch, n_heads, seq_len, seq_len)
-            scores = scores.masked_fill(mask == 0, -1e9)
+            scores = scores.masked_fill(mask == 0, MASKED_VALUE)
 
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)

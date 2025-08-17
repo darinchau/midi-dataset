@@ -54,7 +54,7 @@ class TrainingConfig:
     weight_decay: float
     gradient_clip: float
     beta: float
-    warmup_epochs: int
+    warmup_steps: int
     scheduler: str  # Options: 'none', 'cosine', 'plateau'
 
     # Data configuration
@@ -125,7 +125,7 @@ class TrainingConfig:
             weight_decay=args.weight_decay,
             gradient_clip=args.gradient_clip,
             beta=args.beta,
-            warmup_epochs=args.warmup_epochs,
+            warmup_steps=args.warmup_steps,
             scheduler=args.scheduler,
             val_split=args.val_split,
             val_size=args.val_size if args.val_size is not None else None,
@@ -170,6 +170,10 @@ def setup_logging(log_dir: Path, accelerator: Accelerator):
                 logging.StreamHandler(sys.stdout)
             ]
         )
+
+        # Set subloggers in src to warn and error only
+        for name in ['src.model', 'src.util', 'src.extract']:
+            logging.getLogger(name).setLevel(logging.WARNING)
     else:
         logging.basicConfig(level=logging.ERROR)
 
@@ -288,10 +292,10 @@ def validate(model: VQVAE, val_dataloader: DataLoader, accelerator: Accelerator)
             })
 
             # Accumulate metrics
-            total_loss += losses_gathered['total_loss'].mean().item()
-            total_recon_loss += losses_gathered['recon_loss'].mean().item()
-            total_vq_loss += losses_gathered['vq_loss'].mean().item()
-            total_perplexity += losses_gathered['perplexity'].mean().item()
+            total_loss += losses_gathered['total_loss'].mean().item()  # type: ignore
+            total_recon_loss += losses_gathered['recon_loss'].mean().item()  # type: ignore
+            total_vq_loss += losses_gathered['vq_loss'].mean().item()  # type: ignore
+            total_perplexity += losses_gathered['perplexity'].mean().item()  # type: ignore
             num_batches += 1
 
     # Compute averages
@@ -306,7 +310,7 @@ def validate(model: VQVAE, val_dataloader: DataLoader, accelerator: Accelerator)
 
 
 def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
-                    scheduler, epoch: int,
+                    scheduler, epoch: int, global_step: int,
                     metrics: Dict[str, float], checkpoint_dir: Path,
                     config: TrainingConfig, accelerator: Accelerator,
                     is_best: bool = False):
@@ -318,6 +322,7 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
         optimizer: Optimizer state
         scheduler: Learning rate scheduler state (optional)
         epoch: Current epoch
+        global_step: Current global step
         metrics: Current metrics
         checkpoint_dir: Directory to save checkpoints
         config: Training configuration
@@ -335,6 +340,7 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
 
     checkpoint = {
         'epoch': epoch,
+        'global_step': global_step,
         'model_state_dict': unwrapped_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'metrics': metrics,
@@ -365,7 +371,7 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
 
 def load_checkpoint(checkpoint_path: Path, model: VQVAE,
                     optimizer: Optional[torch.optim.Optimizer] = None,
-                    scheduler=None, accelerator: Accelerator = None) -> int:
+                    scheduler=None, accelerator: Optional[Accelerator] = None) -> Tuple[int, int]:
     """
     Load model checkpoint.
 
@@ -377,12 +383,12 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
         accelerator: Accelerator instance
 
     Returns:
-        Starting epoch number
+        Tuple of (starting epoch number, global step)
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
     # Unwrap model if using accelerator
-    if accelerator:
+    if accelerator is not None:
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
     else:
@@ -395,7 +401,28 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     logging.info(f"Loaded checkpoint from {checkpoint_path}")
-    return checkpoint.get('epoch', 0) + 1
+
+    start_epoch = checkpoint.get('epoch', 0) + 1
+    global_step = checkpoint.get('global_step', 0)
+
+    return start_epoch, global_step
+
+
+def get_warmup_lr(base_lr: float, current_step: int, warmup_steps: int) -> float:
+    """
+    Calculate learning rate during warmup period.
+
+    Args:
+        base_lr: Base learning rate after warmup
+        current_step: Current training step
+        warmup_steps: Total number of warmup steps
+
+    Returns:
+        Adjusted learning rate
+    """
+    if current_step < warmup_steps:
+        return base_lr * (current_step / warmup_steps)
+    return base_lr
 
 
 def train(config: TrainingConfig):
@@ -499,15 +526,15 @@ def train(config: TrainingConfig):
 
     # Load checkpoint if resuming
     start_epoch = 0
+    global_step = 0
     if config.resume_from:
-        start_epoch = load_checkpoint(
+        start_epoch, global_step = load_checkpoint(
             Path(config.resume_from),
             model, optimizer, scheduler, accelerator
         )
 
     # Training loop
     best_val_loss = float('inf')
-    global_step = 0
     epochs_without_improvement = 0
     epoch_metrics: dict[str, float] = {}
 
@@ -535,11 +562,11 @@ def train(config: TrainingConfig):
             inputs = batch['input_ids']
             attention_mask = batch['attention_mask']
 
-            # Learning rate warmup
-            if epoch < config.warmup_epochs:
-                warmup_factor = (epoch * len(train_dataloader) + batch_idx + 1) / (config.warmup_epochs * len(train_dataloader))
+            # Learning rate warmup based on global steps
+            if global_step < config.warmup_steps:
+                warmup_lr = get_warmup_lr(config.learning_rate, global_step, config.warmup_steps)
                 for param_group in optimizer.param_groups:
-                    param_group['lr'] = config.learning_rate * warmup_factor
+                    param_group['lr'] = warmup_lr
 
             # Use accelerator's accumulate context manager
             with accelerator.accumulate(model):
@@ -572,11 +599,13 @@ def train(config: TrainingConfig):
 
             # Update progress bar
             if accelerator.is_local_main_process:
+                current_lr = optimizer.param_groups[0]['lr']
                 progress_bar.set_postfix({
                     'loss': losses['total_loss'].item(),
                     'recon': losses['recon_loss'].item(),
                     'vq': losses['vq_loss'].item(),
-                    'ppl': perplexity.item()
+                    'ppl': perplexity.item(),
+                    'lr': f'{current_lr:.2e}'
                 })
 
             # Log to wandb
@@ -597,8 +626,8 @@ def train(config: TrainingConfig):
         # Validation phase
         val_metrics = validate(model, val_dataloader, accelerator)
 
-        # Update learning rate scheduler
-        if scheduler is not None:
+        # Update learning rate scheduler (after warmup is complete)
+        if scheduler is not None and global_step >= config.warmup_steps:
             if isinstance(scheduler, ReduceLROnPlateau):
                 scheduler.step(val_metrics['val_loss'])
             else:
@@ -608,6 +637,7 @@ def train(config: TrainingConfig):
         epoch_metrics = {**train_losses, **val_metrics}
         epoch_metrics['epoch'] = epoch + 1
         epoch_metrics['learning_rate'] = optimizer.param_groups[0]['lr']
+        epoch_metrics['global_step'] = global_step
 
         if accelerator.is_main_process:
             accelerator.log(epoch_metrics)
@@ -626,7 +656,7 @@ def train(config: TrainingConfig):
         if (epoch + 1) % config.save_interval == 0 or is_best:
             accelerator.wait_for_everyone()
             save_checkpoint(
-                model, optimizer, scheduler, epoch + 1,
+                model, optimizer, scheduler, epoch + 1, global_step,
                 epoch_metrics, checkpoint_dir, config, accelerator, is_best
             )
 
@@ -638,6 +668,8 @@ def train(config: TrainingConfig):
                 f"Train Loss: {train_losses['train_loss']:.4f}, "
                 f"Val Loss: {val_metrics['val_loss']:.4f}, "
                 f"Val Perplexity: {val_metrics['val_perplexity']:.2f}, "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}, "
+                f"Global Step: {global_step}, "
                 f"Time: {epoch_time:.1f}s"
             )
 
@@ -651,7 +683,7 @@ def train(config: TrainingConfig):
     # Final save
     accelerator.wait_for_everyone()
     save_checkpoint(
-        model, optimizer, scheduler, config.num_epochs,
+        model, optimizer, scheduler, config.num_epochs, global_step,
         epoch_metrics, checkpoint_dir, config, accelerator, is_best=False
     )
 
@@ -684,9 +716,9 @@ def main():
                         help='Dropout rate')
 
     # Training configuration
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=2,
                         help='Batch size')
-    parser.add_argument('--grad_accumulation_steps', type=int, default=8,
+    parser.add_argument('--grad_accumulation_steps', type=int, default=32,
                         help='Gradient accumulation steps')
     parser.add_argument('--max_seq_length', type=int, default=8192,
                         help='Maximum sequence length')
@@ -700,8 +732,8 @@ def main():
                         help='Gradient clipping value')
     parser.add_argument('--beta', type=float, default=1.0,
                         help='Weight for reconstruction loss')
-    parser.add_argument('--warmup_epochs', type=int, default=5,
-                        help='Number of warmup epochs')
+    parser.add_argument('--warmup_steps', type=int, default=1000,
+                        help='Number of warmup steps')
     parser.add_argument('--scheduler', type=str, default='cosine',
                         choices=['none', 'cosine', 'plateau'],
                         help='Learning rate scheduler')
