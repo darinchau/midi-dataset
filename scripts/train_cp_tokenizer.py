@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
 Training script for VQ-VAE model for MIDI tokenization.
 """
-
+from __future__ import annotations
 import argparse
 import os
 import sys
@@ -33,47 +32,47 @@ class TrainingConfig:
     """Configuration for training the VQ-VAE model."""
 
     # Model configuration
-    hidden_dims: int = 512
-    num_embeddings: int = 8192
-    n_heads: int = 8
-    n_encoder_blocks: int = 8
-    n_decoder_blocks: int = 8
-    use_dcae: bool = False
-    temperature: float = 1.0
-    dropout: float = 0.1
+    hidden_dims: int
+    num_embeddings: int
+    n_heads: int
+    n_encoder_blocks: int
+    n_decoder_blocks: int
+    use_dcae: bool
+    temperature: float
+    dropout: float
 
     # Training configuration
-    batch_size: int = 8
-    grad_accumulation_steps: int = 8
-    max_seq_length: int = 8192
-    num_epochs: int = 100
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.01
-    gradient_clip: float = 1.0
-    beta: float = 1.0
-    warmup_epochs: int = 5
-    scheduler: str = 'cosine'  # Options: 'none', 'cosine', 'plateau'
+    batch_size: int
+    grad_accumulation_steps: int
+    max_seq_length: int
+    num_epochs: int
+    learning_rate: float
+    weight_decay: float
+    gradient_clip: float
+    beta: float
+    warmup_epochs: int
+    scheduler: str  # Options: 'none', 'cosine', 'plateau'
 
     # Data configuration
-    val_split: float = 0.1
-    val_size: Optional[int] = 100
+    val_split: float
+    val_size: Optional[int]
 
     # Logging configuration
-    output_dir: str = 'outputs/vqvae'
-    log_interval: int = 10
-    save_interval: int = 5
+    output_dir: str
+    log_interval: int
+    save_interval: int
 
     # Wandb configuration
-    run_name: Optional[str] = None
-    wandb_project: str = 'cp-tokenizer-1'
-    wandb_entity: Optional[str] = None
-    wandb_tags: Optional[List[str]] = None
-    no_wandb: bool = False
+    run_name: Optional[str]
+    wandb_project: str
+    wandb_entity: Optional[str]
+    wandb_tags: Optional[List[str]]
+    no_wandb: bool
 
     # Other configuration
-    seed: int = 42
-    resume_from: Optional[str] = None
-    early_stopping_patience: int = 0
+    seed: int
+    resume_from: Optional[str]
+    early_stopping_patience: int
 
     def to_cp_config(self) -> CpConfig:
         """Convert to CpConfig for model initialization."""
@@ -95,7 +94,7 @@ class TrainingConfig:
         return asdict(self)
 
     @classmethod
-    def from_args(cls, args: argparse.Namespace) -> 'TrainingConfig':
+    def from_args(cls, args: argparse.Namespace) -> TrainingConfig:
         """Create TrainingConfig from parsed arguments."""
         # Handle wandb_tags separately since it needs to be converted from string to list
         wandb_tags = None
@@ -112,6 +111,7 @@ class TrainingConfig:
             temperature=args.temperature,
             dropout=args.dropout,
             batch_size=args.batch_size,
+            grad_accumulation_steps=args.grad_accumulation_steps,
             max_seq_length=args.max_seq_length,
             num_epochs=args.num_epochs,
             learning_rate=args.learning_rate,
@@ -121,6 +121,7 @@ class TrainingConfig:
             warmup_epochs=args.warmup_epochs,
             scheduler=args.scheduler,
             val_split=args.val_split,
+            val_size=args.val_size if args.val_size is not None else None,
             output_dir=args.output_dir,
             log_interval=args.log_interval,
             save_interval=args.save_interval,
@@ -131,7 +132,7 @@ class TrainingConfig:
             no_wandb=args.no_wandb,
             seed=args.seed,
             resume_from=args.resume_from,
-            early_stopping_patience=args.early_stopping_patience
+            early_stopping_patience=args.early_stopping_patience,
         )
 
     def save(self, path: Path):
@@ -140,7 +141,7 @@ class TrainingConfig:
             json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
-    def load(cls, path: Path) -> 'TrainingConfig':
+    def load(cls, path: Path) -> TrainingConfig:
         """Load configuration from JSON file."""
         with open(path, 'r') as f:
             config_dict = json.load(f)
@@ -608,7 +609,7 @@ def main():
                         help='Dropout rate')
 
     # Training configuration
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size')
     parser.add_argument('--grad_accumulation_steps', type=int, default=8,
                         help='Gradient accumulation steps')
