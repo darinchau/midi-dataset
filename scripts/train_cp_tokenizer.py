@@ -45,7 +45,7 @@ class TrainingConfig:
     # Training configuration
     batch_size: int = 8
     grad_accumulation_steps: int = 8
-    max_seq_length: int = 2048
+    max_seq_length: int = 8192
     num_epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
@@ -56,6 +56,7 @@ class TrainingConfig:
 
     # Data configuration
     val_split: float = 0.1
+    val_size: Optional[int] = 100
 
     # Logging configuration
     output_dir: str = 'outputs/vqvae'
@@ -197,13 +198,15 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
     train_dataset = CpDataset(
         train_files,
         max_seq_length=config.max_seq_length,
-        on_too_long='truncate'
+        on_too_long='skip'
     )
     val_dataset = CpDataset(
         val_files,
         max_seq_length=config.max_seq_length,
-        on_too_long='truncate'
+        on_too_long='skip'
     )
+
+    num_workers = 0
 
     # Create collator
     collator = CpDataCollator(pad_value=0.0)
@@ -214,7 +217,7 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collator,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True
     )
@@ -224,7 +227,7 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collator,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True
     )
 
@@ -384,16 +387,13 @@ def train(config: TrainingConfig):
     config.save(output_dir / 'config.json')
 
     # Initialize wandb
-    run_name = config.run_name or f"vqvae_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
     # Add run_name to wandb config
     wandb_config = config.to_dict()
-    wandb_config['run_name'] = run_name
 
     wandb.init(
         project=config.wandb_project,
         entity=config.wandb_entity,
-        name=run_name,
+        name=config.run_name,
         config=wandb_config,
         tags=config.wandb_tags,
         mode='online' if not config.no_wandb else 'disabled'
@@ -453,10 +453,10 @@ def train(config: TrainingConfig):
         # Training phase
         model.train()
         train_losses = {
-            'train_loss': 0,
-            'train_recon_loss': 0,
-            'train_vq_loss': 0,
-            'train_perplexity': 0
+            'train_loss': 0.,
+            'train_recon_loss': 0.,
+            'train_vq_loss': 0.,
+            'train_perplexity': 0.
         }
         num_train_batches = 0
 
@@ -474,20 +474,16 @@ def train(config: TrainingConfig):
                     param_group['lr'] = config.learning_rate * warmup_factor
 
             # Forward pass
-            optimizer.zero_grad()
             reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
 
             # Compute losses with beta weighting
             losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
 
+            # Scale loss by gradient accumulation steps
+            loss = losses['total_loss'] / config.grad_accumulation_steps
+
             # Backward pass
-            losses['total_loss'].backward()
-
-            # Gradient clipping
-            if config.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
-
-            optimizer.step()
+            loss.backward()
 
             # Accumulate losses
             train_losses['train_loss'] += losses['total_loss'].item()
@@ -495,7 +491,16 @@ def train(config: TrainingConfig):
             train_losses['train_vq_loss'] += losses['vq_loss'].item()
             train_losses['train_perplexity'] += perplexity.item()
             num_train_batches += 1
-            global_step += 1
+
+            # Update weights every grad_accumulation_steps
+            if (batch_idx + 1) % config.grad_accumulation_steps == 0:
+                # Gradient clipping
+                if config.gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
 
             # Update progress bar
             progress_bar.set_postfix({
@@ -607,7 +612,7 @@ def main():
                         help='Batch size')
     parser.add_argument('--grad_accumulation_steps', type=int, default=8,
                         help='Gradient accumulation steps')
-    parser.add_argument('--max_seq_length', type=int, default=2048,
+    parser.add_argument('--max_seq_length', type=int, default=8192,
                         help='Maximum sequence length')
     parser.add_argument('--num_epochs', type=int, default=100,
                         help='Number of training epochs')
@@ -628,6 +633,8 @@ def main():
     # Data configuration
     parser.add_argument('--val_split', type=float, default=0.1,
                         help='Validation split fraction')
+    parser.add_argument('--val_size', type=int, default=100,
+                        help='Size of validation set (taken after split, to ensure fixed size)')
 
     # Logging configuration
     parser.add_argument('--output_dir', type=str, default='outputs/vqvae',

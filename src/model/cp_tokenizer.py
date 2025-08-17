@@ -492,7 +492,7 @@ class CpDataset(Dataset):
         files: List of file paths containing tokenized sequences
         max_seq_length: Maximum sequence length for truncation
         on_too_long: Action to take if sequence exceeds max length ('truncate' or 'skip')
-"""
+    """
 
     def __init__(self, files: list[str], max_seq_length: Optional[int] = None, on_too_long: str = 'truncate'):
         self.files = files
@@ -526,11 +526,12 @@ class CpDataset(Dataset):
 
         data_tensor = torch.from_numpy(data).float()
 
-        #
+        # Check if max_seq_length is set and truncate or skip if necessary
         if self.max_seq_length is not None and data_tensor.shape[0] > self.max_seq_length:
             if self.on_too_long == 'truncate':
                 data_tensor = data_tensor[:self.max_seq_length]
             elif self.on_too_long == 'skip':
+                logging.warning(f"Skipping sequence from {file} due to length {data_tensor.shape[0]} > {self.max_seq_length}")
                 return self.__getitem__(np.random.randint(0, len(self.files)))
             else:
                 raise ValueError(f"Invalid on_too_long value: {self.on_too_long}")

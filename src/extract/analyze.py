@@ -77,15 +77,7 @@ def parse_musicxml(xml_path: str):
         xml_path (str): Path to the MusicXML file.
 
     Returns:
-        np.ndarray: A (T, d) 2D array where T is the number of time steps and d is the number of dimensions
-        The dimesions are:
-        - Instrument (128x, one-hot encoded)
-        - Pitch (128x, one-hot encoded)
-        - Velocity (0-1)
-        - Onset (# Quarter notes from start of the bar)
-        - Duration (# Quarter notes)
-        - Current time signature (16x, one-hot encoded)
-        - Bar line? (0 or 1)
+        List[MusicXMLNote]: List of MusicXMLNote objects parsed from the file.
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()

@@ -16,16 +16,47 @@ from datetime import datetime
 import os
 import time
 import pandas as pd
+from src.constants import XML_ROOT, METADATA_PATH, MIDI_ROOT
 
 
-def load_mapping(root: str) -> pd.DataFrame:
+def load_mapping() -> pd.DataFrame:
+    """Loads the mapping of MIDI files to their metadata."""
+    root = METADATA_PATH
     df = pd.read_csv(os.path.join(root, "mapping.csv"), sep='\t')
     df['original_path'] = df['original_path'].apply(lambda x: x.replace("\\", "/"))
     return df
 
 
-def create_aria_labels(root: str, df: pd.DataFrame):
+def get_xml_notes():
+    """Returns a list of all XML files in the dataset."""
+    from src.util import iterate_dataset
+
+
+def create_xml_lengths():
+    """Creates the lengths of the MIDI files in seconds."""
+    from src.extract.analyze import musicxml_to_notes
+
+    df = load_mapping()
+
+    def xml_note_count(index: str) -> int:
+        try:
+            fp = get_path(XML_ROOT, index)
+            notes_data = musicxml_to_notes(fp)
+            return len([x for x in notes_data if not x.barline])
+        except Exception as e:
+            print(f"Error processing {index}: {e}")
+            return -1
+
+    tqdm.pandas()
+
+    df['xml_note_count'] = df['index'].progress_apply(xml_note_count)
+    df.to_csv(os.path.join(METADATA_PATH, "xml_note_counts.csv"), index=False, sep="\t")
+    return df
+
+
+def create_aria_labels():
     """Creates the key aria labels: difficulty, form, key_signature, time_signature, music_period, style, composer in the ARIA dataset"""
+    df = load_mapping()
     print(f"Creating aria labels for {len(df)} files...")
 
     json_path = "E:/data/raw-midi-data/data/data/v2/aria-midi-v1-ext/aria-midi-v1-ext/metadata.json"
@@ -56,16 +87,19 @@ def create_aria_labels(root: str, df: pd.DataFrame):
 
     df['aria_labels'] = df['aria_midi_number'].apply(apply)
     df.drop(columns=['aria_midi_number'], inplace=True)
+
+    df.to_csv(os.path.join(METADATA_PATH, "aria_labels.csv"), index=False, sep="\t")
     return df
 
 
-def create_lengths(root: str, df: pd.DataFrame):
+def create_lengths():
     """Creates the lengths of the MIDI files in seconds."""
     import pretty_midi
+    df = load_mapping()
 
-    def midi_file_length(root: str, index: str) -> float:
+    def midi_file_length(index: str) -> float:
         try:
-            path = get_path(root, index)
+            path = get_path(MIDI_ROOT, index)
             midi_data = pretty_midi.PrettyMIDI(path)
             length_in_seconds = midi_data.get_end_time()
             return length_in_seconds
@@ -74,13 +108,16 @@ def create_lengths(root: str, df: pd.DataFrame):
 
     tqdm.pandas()
 
-    df['length'] = df['index'].progress_map(lambda idx: midi_file_length(root, idx))
+    df['length'] = df['index'].progress_map(midi_file_length)
+    df.to_csv(os.path.join(METADATA_PATH, "lengths.csv"), index=False, sep="\t")
     return df
 
 
-def create_note_counts(root: str, df: pd.DataFrame):
+def create_note_counts():
     """Counts the number of notes in each MIDI file."""
     import pretty_midi
+
+    df = load_mapping()
 
     def count_notes_in_midi(midi_file_path: str):
         try:
@@ -92,13 +129,17 @@ def create_note_counts(root: str, df: pd.DataFrame):
         except Exception as e:
             return -1
     tqdm.pandas(desc="Counting notes...")
-    df['note_count'] = df['index'].progress_apply(lambda x: count_notes_in_midi(get_path(root, x)))
+    df['note_count'] = df['index'].progress_apply(lambda x: count_notes_in_midi(get_path(MIDI_ROOT, x)))
+    df.to_csv(os.path.join(METADATA_PATH, "note_counts.csv"), index=False, sep="\t")
     return df
 
 
-def make_deepseek_labels(root: str, df: pd.DataFrame):
+def make_deepseek_labels():
     """Labels MIDI files using DeepSeek API. Does not create the key since deepseek results will benefit so much from some data cleaning"""
     from openai import OpenAI
+
+    df = load_mapping()
+    print(f"Creating deepseek labels for {len(df)} files...")
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
@@ -234,7 +275,7 @@ def make_deepseek_labels(root: str, df: pd.DataFrame):
 def create_mmd_genre():
     """Create a mapping of MetaMidi Dataset MIDI files to their genres."""
     import pandas as pd
-    df = pd.read_csv("E:/data/midi-metadata/mapping.csv", sep="\t")
+    df = load_mapping()
 
     def apply(path):
         is_mmd = "v2/MMD_MIDI" in path
@@ -300,4 +341,6 @@ def create_mmd_genre():
     df.drop(['original_path', 'md5', 'mmd_hash'], axis=1, inplace=True)
     df = df[df['genre'].notna()]
 
-    df.to_csv("E:/data/midi-metadata/mmd_genre.csv", index=False, sep="\t")
+    df.to_csv(os.path.join(METADATA_PATH, "mmd_genres.csv"), index=False, sep="\t")
+    print(f"Created MMD genres mapping with {len(df)} entries.")
+    return df
