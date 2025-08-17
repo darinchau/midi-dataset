@@ -27,13 +27,8 @@ def load_mapping() -> pd.DataFrame:
     return df
 
 
-def get_xml_notes():
-    """Returns a list of all XML files in the dataset."""
-    from src.util import iterate_dataset
-
-
-def create_xml_lengths():
-    """Creates the lengths of the MIDI files in seconds."""
+def create_xml_note_counts():
+    """Creates the num."""
     from src.extract.analyze import musicxml_to_notes
 
     df = load_mapping()
@@ -344,3 +339,7 @@ def create_mmd_genre():
     df.to_csv(os.path.join(METADATA_PATH, "mmd_genres.csv"), index=False, sep="\t")
     print(f"Created MMD genres mapping with {len(df)} entries.")
     return df
+
+
+if __name__ == "__main__":
+    create_xml_note_counts()
