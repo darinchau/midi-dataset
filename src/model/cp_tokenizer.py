@@ -60,6 +60,9 @@ class CpConfig:
     # Padding token value
     pad_token_id: int = 0
 
+    # Whether to use gradient checkpointing
+    use_checkpoint: bool = False
+
 
 class VectorQuantizer(nn.Module):
     """
@@ -277,7 +280,7 @@ class TransformerBlock(nn.Module):
     Transformer block with self-attention and feed-forward network.
     """
 
-    def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1):
+    def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1, use_checkpoint=False):
         super().__init__()
         if d_ff is None:
             d_ff = 4 * d_model
@@ -294,14 +297,33 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, attention_mask=None):
-        # Self-attention with residual connection
-        attn_output = self.attention(x, attention_mask)
-        x = self.norm1(x + attn_output)
+        self.use_checkpoint = use_checkpoint
 
-        # Feed-forward with residual connection
-        ff_output = self.feed_forward(x)
-        x = self.norm2(x + ff_output)
+    def forward(self, x, attention_mask=None):
+        if self.use_checkpoint and self.training:
+            from torch.utils.checkpoint import checkpoint
+
+            # Checkpoint self-attention block
+            def attn_block(x, attention_mask):
+                attn_output = self.attention(x, attention_mask)
+                return self.norm1(x + attn_output)
+
+            x = checkpoint(attn_block, x, attention_mask, use_reentrant=False)
+
+            # Checkpoint feed-forward block
+            def ff_block(x):
+                ff_output = self.feed_forward(x)
+                return self.norm2(x + ff_output)
+
+            x = checkpoint(ff_block, x, use_reentrant=False)
+        else:
+            # Self-attention with residual connection
+            attn_output = self.attention(x, attention_mask)
+            x = self.norm1(x + attn_output)
+
+            # Feed-forward with residual connection
+            ff_output = self.feed_forward(x)
+            x = self.norm2(x + ff_output)
 
         return x
 
@@ -312,15 +334,15 @@ class VQVAEEncoder(nn.Module):
     """
 
     def __init__(self, d1, d2, num_embeddings, n_attention_blocks=3, n_heads=8,
-                 dropout=0.1, use_dcae=False, temperature=1.0):
+                 dropout=0.1, use_dcae=False, temperature=1.0, use_checkpoint=False):
         super().__init__()
 
         # Initial projection
         self.input_projection = nn.Linear(d1, d2)
 
-        # Self-attention blocks
+        # Self-attention blocks with optional checkpointing
         self.attention_blocks = nn.ModuleList([
-            TransformerBlock(d2, n_heads, dropout=dropout)
+            TransformerBlock(d2, n_heads, dropout=dropout, use_checkpoint=use_checkpoint)
             for _ in range(n_attention_blocks)
         ])
 
@@ -356,12 +378,12 @@ class VQVAEDecoder(nn.Module):
     Decoder that reconstructs the original input from quantized representations.
     """
 
-    def __init__(self, d2, d1, n_attention_blocks=3, n_heads=8, dropout=0.1):
+    def __init__(self, d2, d1, n_attention_blocks=3, n_heads=8, dropout=0.1, use_checkpoint=False):
         super().__init__()
 
-        # Self-attention blocks
+        # Self-attention blocks with optional checkpointing
         self.attention_blocks = nn.ModuleList([
-            TransformerBlock(d2, n_heads, dropout=dropout)
+            TransformerBlock(d2, n_heads, dropout=dropout, use_checkpoint=use_checkpoint)
             for _ in range(n_attention_blocks)
         ])
 
@@ -390,7 +412,7 @@ class VQVAE(nn.Module):
 
     def __init__(self, d1, d2, num_embeddings, n_encoder_blocks=3, n_decoder_blocks=3,
                  n_heads=8, dropout=0.1, commitment_cost=0.25,
-                 use_dcae=False, temperature=1.0):
+                 use_dcae=False, temperature=1.0, use_checkpoint=False):
         super().__init__()
 
         self.encoder = VQVAEEncoder(
@@ -399,19 +421,22 @@ class VQVAE(nn.Module):
             n_heads=n_heads,
             dropout=dropout,
             use_dcae=use_dcae,
-            temperature=temperature
+            temperature=temperature,
+            use_checkpoint=use_checkpoint
         )
 
         self.decoder = VQVAEDecoder(
             d2, d1,
             n_attention_blocks=n_decoder_blocks,
             n_heads=n_heads,
-            dropout=dropout
+            dropout=dropout,
+            use_checkpoint=use_checkpoint
         )
 
         # Store commitment cost for loss calculation
         self.commitment_cost = commitment_cost
         self.use_dcae = use_dcae
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, x, attention_mask=None):
         # Encode and quantize
@@ -642,7 +667,8 @@ def get_model(config: CpConfig) -> VQVAE:
         n_heads=config.n_heads,
         dropout=config.dropout,
         use_dcae=config.use_dcae,
-        temperature=config.temperature
+        temperature=config.temperature,
+        use_checkpoint=config.use_checkpoint
     )
 
     model.to(device)

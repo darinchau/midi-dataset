@@ -31,7 +31,7 @@ from typing import Dict, Optional, Tuple
 from src.model.cp_tokenizer import CpConfig, VQVAE, CpDataset, CpDataCollator, get_model
 
 
-@dataclass
+@dataclass(frozen=True)
 class TrainingConfig:
     """Configuration for training the VQ-VAE model."""
 
@@ -44,6 +44,7 @@ class TrainingConfig:
     use_dcae: bool
     temperature: float
     dropout: float
+    use_checkpoint: bool  # Add this field
 
     # Training configuration
     batch_size: int
@@ -93,7 +94,8 @@ class TrainingConfig:
             dropout=self.dropout,
             temperature=self.temperature,
             batch_size=self.batch_size,
-            max_seq_length=self.max_seq_length
+            max_seq_length=self.max_seq_length,
+            use_checkpoint=self.use_checkpoint,
         )
 
     def to_dict(self) -> dict:
@@ -117,6 +119,7 @@ class TrainingConfig:
             use_dcae=args.use_dcae,
             temperature=args.temperature,
             dropout=args.dropout,
+            use_checkpoint=args.use_checkpoint,
             batch_size=args.batch_size,
             grad_accumulation_steps=args.grad_accumulation_steps,
             max_seq_length=args.max_seq_length,
@@ -714,6 +717,8 @@ def main():
                         help='Temperature for DCAE')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate')
+    parser.add_argument('--use_checkpoint', action='store_true',
+                        help='Use gradient checkpointing to save memory')
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=2,
