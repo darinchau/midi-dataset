@@ -5,7 +5,7 @@ import pandas as pd
 import os
 import json
 from tqdm import tqdm
-from src.util import get_path
+from src.utils import get_path
 import logging
 import traceback
 from threading import Lock
