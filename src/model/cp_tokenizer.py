@@ -1,7 +1,6 @@
 # Tokenizes MIDI compound words (cp) into discrete tokens
 
 from torch.utils.data import DataLoader
-from ..utils import get_all_xml_paths
 import os
 import torch
 import torch.nn as nn
@@ -14,10 +13,12 @@ import logging
 from functools import cache
 from tqdm import tqdm
 from typing import Dict, List, Optional, Union
+import random
 from ..extract import musicxml_to_notes
 from ..extract.tokenize import notes_to_tokens
 from ..constants import XML_ROOT
 from ..utils import get_path
+from ..utils import get_all_xml_paths
 
 MASKED_VALUE = -1e+4
 
@@ -517,11 +518,25 @@ class CpDataset(Dataset):
 
     Args:
         files: List of file paths containing tokenized sequences
+        split: Optional 3-tuple that specifies a seed, start, and end of the dataset
         max_seq_length: Maximum sequence length for truncation
         on_too_long: Action to take if sequence exceeds max length ('truncate' or 'skip')
     """
 
-    def __init__(self, files: list[str], max_seq_length: Optional[int] = None, on_too_long: str = 'truncate'):
+    def __init__(self, files: list[str] | None = None, split: tuple[int, int, int] | None = None, max_seq_length: Optional[int] = None, on_too_long: str = 'truncate'):
+        if not files and not split:
+            raise ValueError("Either 'files' or 'split' must be provided")
+
+        if files is None:
+            assert split is not None, "If 'files' is None, 'split' must be provided"
+            files = get_all_xml_paths()
+            seed, start, end = split
+            r = random.Random(seed)
+            r.shuffle(files)
+            files = files[start:end]
+
+        if not files:
+            raise ValueError("No files found for the given split")
         self.files = files
         self.max_seq_length = max_seq_length
         self.on_too_long = on_too_long
@@ -549,7 +564,7 @@ class CpDataset(Dataset):
             data = load_musicxml_tokens(file)
         except Exception as e:
             logging.error(f"Error loading {file}: {e}")
-            return self.__getitem__(np.random.randint(0, len(self.files)))
+            return self.get(np.random.randint(0, len(self.files)))
 
         data_tensor = torch.from_numpy(data).float()
 
@@ -559,7 +574,7 @@ class CpDataset(Dataset):
                 data_tensor = data_tensor[:self.max_seq_length]
             elif self.on_too_long == 'skip':
                 logging.info(f"Skipping sequence from {file} due to length {data_tensor.shape[0]} > {self.max_seq_length}")
-                return self.__getitem__(np.random.randint(0, len(self.files)))
+                return self.get(np.random.randint(0, len(self.files)))
             else:
                 raise ValueError(f"Invalid on_too_long value: {self.on_too_long}")
 

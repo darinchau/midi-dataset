@@ -59,6 +59,7 @@ class TrainingConfig:
     beta: float
     warmup_steps: int
     scheduler: str  # Options: 'none', 'cosine', 'plateau'
+    num_workers: int
 
     # Data configuration
     val_split: float
@@ -133,6 +134,7 @@ class TrainingConfig:
             beta=args.beta,
             warmup_steps=args.warmup_steps,
             scheduler=args.scheduler,
+            num_workers=args.num_workers,
             val_split=args.val_split,
             val_size=args.val_size if args.val_size is not None else None,
             output_dir=args.output_dir,
@@ -209,29 +211,27 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
     """
     from src.utils import get_all_xml_paths
 
-    files = get_all_xml_paths()
-    total_files = len(files)
+    total_files = len(get_all_xml_paths())
     val_size = int(total_files * config.val_split)
     train_size = total_files - val_size
 
     # Shuffle files and split
-    random.shuffle(files)
-    train_files = files[:train_size]
-    val_files = files[train_size:]
+    train_split = (config.seed, 0, train_size)
+    val_split = (config.seed, train_size, train_size + val_size)
 
     # Create datasets
     train_dataset = CpDataset(
-        train_files,
+        split=train_split,
         max_seq_length=config.max_seq_length,
         on_too_long='skip'
     )
     val_dataset = CpDataset(
-        val_files,
+        split=val_split,
         max_seq_length=config.max_seq_length,
         on_too_long='skip'
     )
 
-    num_workers = 0
+    num_workers = config.num_workers
 
     # Create collator
     collator = CpDataCollator(pad_value=0.0)
@@ -744,6 +744,8 @@ def main():
     parser.add_argument('--scheduler', type=str, default='cosine',
                         choices=['none', 'cosine', 'plateau'],
                         help='Learning rate scheduler')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of data loader workers')
 
     # Data configuration
     parser.add_argument('--val_split', type=float, default=0.1,
@@ -783,7 +785,7 @@ def main():
                         help='Resume from checkpoint')
     parser.add_argument('--early_stopping_patience', type=int, default=0,
                         help='Early stopping patience (0 to disable)')
-    parser.add_argument('limit_gpu_temp', type=int, default=100,
+    parser.add_argument('--limit_gpu_temp', type=int, default=100,
                         help='Temperature in Celsius to wait for GPU to cool down before training '
                         '(defaults to 100 which if your GPU is above 100C you have bigger problems)')
 
