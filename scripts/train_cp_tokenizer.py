@@ -29,6 +29,7 @@ import logging
 from typing import Dict, Optional, Tuple
 
 from src.model.cp_tokenizer import CpConfig, VQVAE, CpDataset, CpDataCollator, get_model
+from src.utils.model import print_model_hierarchy
 
 
 @dataclass(frozen=True)
@@ -175,7 +176,7 @@ def setup_logging(log_dir: Path, accelerator: Accelerator):
         )
 
         # Set subloggers in src to warn and error only
-        for name in ['src.model', 'src.util', 'src.extract']:
+        for name in ['src.model', 'src.util', 'src.extract', 'src.model.cp_tokenizer']:
             logging.getLogger(name).setLevel(logging.WARNING)
     else:
         logging.basicConfig(level=logging.ERROR)
@@ -563,6 +564,8 @@ def train(config: TrainingConfig):
         )
 
         for batch_idx, batch in enumerate(progress_bar):
+            torch.cuda.empty_cache()
+
             # Accelerator handles device placement
             inputs = batch['input_ids']
             attention_mask = batch['attention_mask']
@@ -573,15 +576,9 @@ def train(config: TrainingConfig):
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = warmup_lr
 
-            # Use accelerator's accumulate context manager
             with accelerator.accumulate(model):
-                # Forward pass
                 reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
-
-                # Compute losses with beta weighting
                 losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
-
-                # Backward pass (accelerator handles scaling)
                 accelerator.backward(losses['total_loss'])
 
                 # Gradient clipping
@@ -591,7 +588,6 @@ def train(config: TrainingConfig):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # Accumulate losses
             train_losses['train_loss'] += losses['total_loss'].item()
             train_losses['train_recon_loss'] += losses['recon_loss'].item()
             train_losses['train_vq_loss'] += losses['vq_loss'].item()
@@ -756,7 +752,7 @@ def main():
                         help='Output directory')
     parser.add_argument('--log_interval', type=int, default=10,
                         help='Logging interval (steps)')
-    parser.add_argument('--save_interval', type=int, default=5000,
+    parser.add_argument('--save_interval', type=int, default=1000,
                         help='Checkpoint save interval (steps)')
 
     # Wandb configuration

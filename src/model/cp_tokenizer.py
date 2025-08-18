@@ -558,7 +558,7 @@ class CpDataset(Dataset):
             if self.on_too_long == 'truncate':
                 data_tensor = data_tensor[:self.max_seq_length]
             elif self.on_too_long == 'skip':
-                logging.warning(f"Skipping sequence from {file} due to length {data_tensor.shape[0]} > {self.max_seq_length}")
+                logging.info(f"Skipping sequence from {file} due to length {data_tensor.shape[0]} > {self.max_seq_length}")
                 return self.__getitem__(np.random.randint(0, len(self.files)))
             else:
                 raise ValueError(f"Invalid on_too_long value: {self.on_too_long}")
