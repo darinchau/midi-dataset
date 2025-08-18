@@ -30,6 +30,7 @@ from typing import Dict, Optional, Tuple
 
 from src.model.cp_tokenizer import CpConfig, VQVAE, CpDataset, CpDataCollator, get_model
 from src.utils.model import print_model_hierarchy
+from src.utils.gpu_monitor import wait_until_gpu_drops_below_temp
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,7 @@ class TrainingConfig:
     use_dcae: bool
     temperature: float
     dropout: float
-    use_checkpoint: bool  # Add this field
+    use_checkpoint: bool  # Whether to use gradient checkpointing
 
     # Training configuration
     batch_size: int
@@ -82,6 +83,7 @@ class TrainingConfig:
     seed: int
     resume_from: Optional[str]
     early_stopping_patience: int
+    limit_gpu_temp: int  # Temperature in Celsius to wait for GPU to cool down
 
     def to_cp_config(self) -> CpConfig:
         """Convert to CpConfig for model initialization."""
@@ -145,6 +147,7 @@ class TrainingConfig:
             seed=args.seed,
             resume_from=args.resume_from,
             early_stopping_patience=args.early_stopping_patience,
+            limit_gpu_temp=args.limit_gpu_temp
         )
 
     def save(self, path: Path):
@@ -565,6 +568,7 @@ def train(config: TrainingConfig):
 
         for batch_idx, batch in enumerate(progress_bar):
             torch.cuda.empty_cache()
+            wait_until_gpu_drops_below_temp(config.limit_gpu_temp)
 
             # Accelerator handles device placement
             inputs = batch['input_ids']
@@ -779,6 +783,9 @@ def main():
                         help='Resume from checkpoint')
     parser.add_argument('--early_stopping_patience', type=int, default=0,
                         help='Early stopping patience (0 to disable)')
+    parser.add_argument('limit_gpu_temp', type=int, default=100,
+                        help='Temperature in Celsius to wait for GPU to cool down before training '
+                        '(defaults to 100 which if your GPU is above 100C you have bigger problems)')
 
     # Config file support
     parser.add_argument('--config_file', type=str, default=None,
