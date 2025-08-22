@@ -45,6 +45,7 @@ def create_xml_note_counts():
     tqdm.pandas()
 
     df['xml_note_count'] = df['index'].progress_apply(xml_note_count)
+    df.drop("original_path", axis=1, inplace=True)
     df.to_csv(os.path.join(METADATA_PATH, "xml_note_counts.csv"), index=False, sep="\t")
     return df
 
