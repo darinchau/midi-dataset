@@ -15,8 +15,17 @@ def get_gpu_temperature():
         return None
 
 
-def wait_until_gpu_drops_below_temp(temp: float = 42., interval: float = 5.0):
+def wait_until_gpu_drops_below_temp(temp: int | float | str = 42., interval: float = 5.0):
     """Wait until the GPU temperature drops below a specified threshold."""
+    if isinstance(temp, str):
+        try:
+            with open(temp, 'r') as f:
+                data = json.load(f)
+                temp = data.get('max_temp', 100)
+        except Exception as e:
+            print(f"Error reading temperature from {temp}: {e}")
+            return
+    assert isinstance(temp, (int, float)), f"Temperature must be an int or float, got {temp}"
     if temp >= 100:
         return
     while True:

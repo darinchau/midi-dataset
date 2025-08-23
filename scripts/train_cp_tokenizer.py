@@ -86,7 +86,7 @@ class TrainingConfig:
     seed: int
     resume_from: Optional[str]
     early_stopping_patience: int
-    limit_gpu_temp: int  # Temperature in Celsius to wait for GPU to cool down
+    limit_gpu_temp: int | str  # Temperature in Celsius to wait for GPU to cool down
 
     def to_cp_config(self) -> CpConfig:
         """Convert to CpConfig for model initialization."""
@@ -745,9 +745,12 @@ def main():
                         help='Resume from checkpoint')
     parser.add_argument('--early_stopping_patience', type=int, default=0,
                         help='Early stopping patience (0 to disable)')
-    parser.add_argument('--limit_gpu_temp', type=int, default=100,
+    parser.add_argument('--limit_gpu_temp', default=100,
                         help='Temperature in Celsius to wait for GPU to cool down before training '
-                        '(defaults to 100 which if your GPU is above 100C you have bigger problems)')
+                        '(defaults to 100 which if your GPU is above 100C you have bigger problems) '
+                        'If input is a string it will be interpreted as a path to a JSON file '
+                        'where the key "max_temp" will be used as the temperature threshold.'
+                        'This is useful for running with dynamic GPU load.')
 
     # Config file support
     parser.add_argument('--config_file', type=str, default=None,
