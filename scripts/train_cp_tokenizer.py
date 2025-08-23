@@ -64,6 +64,8 @@ class TrainingConfig:
     # Data configuration
     val_split: float
     val_size: Optional[int]
+    val_interval: int
+    max_train_steps: Optional[int]
 
     # Logging configuration
     output_dir: str
@@ -137,6 +139,8 @@ class TrainingConfig:
             num_workers=args.num_workers,
             val_split=args.val_split,
             val_size=args.val_size if args.val_size is not None else None,
+            val_interval=args.val_interval,
+            max_train_steps=args.max_train_steps if args.max_train_steps is not None else None,
             output_dir=args.output_dir,
             log_interval=args.log_interval,
             save_interval=args.save_interval,
@@ -307,20 +311,25 @@ def validate(model: VQVAE, val_dataloader: DataLoader, accelerator: Accelerator)
 
     # Compute averages
     metrics = {
-        'val_loss': total_loss / num_batches,
-        'val_recon_loss': total_recon_loss / num_batches,
-        'val_vq_loss': total_vq_loss / num_batches,
-        'val_perplexity': total_perplexity / num_batches
+        'val/loss': total_loss / num_batches,
+        'val/recon_loss': total_recon_loss / num_batches,
+        'val/vq_loss': total_vq_loss / num_batches,
+        'val/perplexity': total_perplexity / num_batches
     }
 
     return metrics
 
 
-def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
-                    scheduler, epoch: int, global_step: int,
-                    metrics: Dict[str, float], checkpoint_dir: Path,
-                    config: TrainingConfig, accelerator: Accelerator,
-                    is_best: bool = False):
+def save_checkpoint(
+    model: VQVAE,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    training_step: int,
+    global_step: int,
+    checkpoint_dir: Path,
+    config: TrainingConfig,
+    accelerator: Accelerator,
+):
     """
     Save model checkpoint.
 
@@ -330,11 +339,9 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
         scheduler: Learning rate scheduler state (optional)
         epoch: Current epoch
         global_step: Current global step
-        metrics: Current metrics
         checkpoint_dir: Directory to save checkpoints
         config: Training configuration
         accelerator: Accelerator instance
-        is_best: Whether this is the best model so far
     """
     # Only save on main process
     if not accelerator.is_main_process:
@@ -346,29 +353,19 @@ def save_checkpoint(model: VQVAE, optimizer: torch.optim.Optimizer,
     unwrapped_model = accelerator.unwrap_model(model)
 
     checkpoint = {
-        'epoch': epoch,
+        'training_step': training_step,
         'global_step': global_step,
         'model_state_dict': unwrapped_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'metrics': metrics,
-        'config': config.to_dict()
+        'config': config.to_dict(),
     }
 
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
     # Save regular checkpoint
-    checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pt'
+    checkpoint_path = checkpoint_dir / f'model_{global_step:5d}.pt'
     accelerator.save(checkpoint, checkpoint_path)
-
-    # Save best model
-    if is_best:
-        best_path = checkpoint_dir / 'best_model.pt'
-        accelerator.save(checkpoint, best_path)
-
-    # Save latest checkpoint (for resuming)
-    latest_path = checkpoint_dir / 'latest_checkpoint.pt'
-    accelerator.save(checkpoint, latest_path)
 
     # Save config alongside checkpoint
     config.save(checkpoint_dir / 'config.json')
@@ -390,7 +387,7 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
         accelerator: Accelerator instance
 
     Returns:
-        Tuple of (starting epoch number, global step)
+        Tuple of (training step, global step)
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
@@ -409,10 +406,10 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
 
     logging.info(f"Loaded checkpoint from {checkpoint_path}")
 
-    start_epoch = checkpoint.get('epoch', 0) + 1
+    training_step = checkpoint.get('training_step', 0)
     global_step = checkpoint.get('global_step', 0)
 
-    return start_epoch, global_step
+    return training_step, global_step
 
 
 def get_warmup_lr(base_lr: float, current_step: int, warmup_steps: int) -> float:
@@ -534,39 +531,31 @@ def train(config: TrainingConfig):
         scheduler = accelerator.prepare(scheduler)
 
     # Load checkpoint if resuming
-    start_epoch = 0
+    # Training step: Number of batches processed
+    # Global step: Number of optimizer updates
+    training_step = 0
     global_step = 0
     if config.resume_from:
-        start_epoch, global_step = load_checkpoint(
+        training_step, global_step = load_checkpoint(
             Path(config.resume_from),
             model, optimizer, scheduler, accelerator
         )
 
+    # Print model hierarchy
+    if accelerator.is_main_process:
+        print_model_hierarchy(model)
+
     # Training loop
-    best_val_loss = float('inf')
-    epochs_without_improvement = 0
-    epoch_metrics: dict[str, float] = {}
+    progress_bar = tqdm(
+        train_dataloader,
+        desc=f"Training model...",
+        disable=not accelerator.is_local_main_process
+    )
 
-    for epoch in range(start_epoch, config.num_epochs):
-        epoch_start_time = datetime.now()
+    stop_training = False
 
-        # Training phase
-        model.train()
-        train_losses = {
-            'train_loss': 0.,
-            'train_recon_loss': 0.,
-            'train_vq_loss': 0.,
-            'train_perplexity': 0.
-        }
-        num_train_batches = 0
-
-        progress_bar = tqdm(
-            train_dataloader,
-            desc=f"Epoch {epoch+1}/{config.num_epochs}",
-            disable=not accelerator.is_local_main_process
-        )
-
-        for batch_idx, batch in enumerate(progress_bar):
+    while not stop_training:
+        for _, batch in enumerate(progress_bar):
             torch.cuda.empty_cache()
             wait_until_gpu_drops_below_temp(config.limit_gpu_temp)
 
@@ -581,6 +570,7 @@ def train(config: TrainingConfig):
                     param_group['lr'] = warmup_lr
 
             with accelerator.accumulate(model):
+                training_step += 1
                 reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
                 losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
                 accelerator.backward(losses['total_loss'])
@@ -592,13 +582,7 @@ def train(config: TrainingConfig):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            train_losses['train_loss'] += losses['total_loss'].item()
-            train_losses['train_recon_loss'] += losses['recon_loss'].item()
-            train_losses['train_vq_loss'] += losses['vq_loss'].item()
-            train_losses['train_perplexity'] += perplexity.item()
-            num_train_batches += 1
-
-            # Update global step
+            # Update step
             if accelerator.sync_gradients:
                 global_step += 1
 
@@ -607,89 +591,61 @@ def train(config: TrainingConfig):
                 current_lr = optimizer.param_groups[0]['lr']
                 progress_bar.set_postfix({
                     'loss': losses['total_loss'].item(),
-                    'recon': losses['recon_loss'].item(),
-                    'vq': losses['vq_loss'].item(),
-                    'ppl': perplexity.item(),
-                    'lr': f'{current_lr:.2e}'
-                })
-
-            # Log to wandb
-            if global_step % config.log_interval == 0 and accelerator.is_main_process:
-                accelerator.log({
-                    'train/loss': losses['total_loss'].item(),
-                    'train/recon_loss': losses['recon_loss'].item(),
-                    'train/vq_loss': losses['vq_loss'].item(),
-                    'train/perplexity': perplexity.item(),
-                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    'lr': f'{current_lr:.2e}',
                     'global_step': global_step
                 })
 
-        # Average training losses
-        for key in train_losses:
-            train_losses[key] /= num_train_batches
+            metrics = {
+                'train/loss': losses['total_loss'].item(),
+                'train/recon_loss': losses['recon_loss'].item(),
+                'train/vq_loss': losses['vq_loss'].item(),
+                'train/perplexity': perplexity.item(),
+                'train/learning_rate': optimizer.param_groups[0]['lr'],
+                'global_step': global_step
+            }
 
-        # Validation phase
-        val_metrics = validate(model, val_dataloader, accelerator)
+            # Log to wandb
+            if global_step % config.log_interval == 0 and accelerator.is_main_process:
+                accelerator.log(metrics, step=training_step)
 
-        # Update learning rate scheduler (after warmup is complete)
-        if scheduler is not None and global_step >= config.warmup_steps:
-            if isinstance(scheduler, ReduceLROnPlateau):
-                scheduler.step(val_metrics['val_loss'])
-            else:
-                scheduler.step()
-
-        # Log epoch metrics
-        epoch_metrics = {**train_losses, **val_metrics}
-        epoch_metrics['epoch'] = epoch + 1
-        epoch_metrics['learning_rate'] = optimizer.param_groups[0]['lr']
-        epoch_metrics['global_step'] = global_step
-
-        if accelerator.is_main_process:
-            accelerator.log(epoch_metrics)
-
-        # Check if best model
-        is_best = val_metrics['val_loss'] < best_val_loss
-        if is_best:
-            best_val_loss = val_metrics['val_loss']
-            epochs_without_improvement = 0
-            if accelerator.is_main_process:
-                logger.info(f"New best model! Val loss: {best_val_loss:.4f}")
-        else:
-            epochs_without_improvement += 1
-
-        # Save checkpoint
-        if (global_step + 1) % config.save_interval == 0 or is_best:
-            accelerator.wait_for_everyone()
-            save_checkpoint(
-                model, optimizer, scheduler, epoch + 1, global_step,
-                epoch_metrics, checkpoint_dir, config, accelerator, is_best
-            )
-
-        # Log epoch summary
-        if accelerator.is_main_process:
-            epoch_time = (datetime.now() - epoch_start_time).total_seconds()
-            logger.info(
-                f"Epoch {epoch+1}/{config.num_epochs} - "
-                f"Train Loss: {train_losses['train_loss']:.4f}, "
-                f"Val Loss: {val_metrics['val_loss']:.4f}, "
-                f"Val Perplexity: {val_metrics['val_perplexity']:.2f}, "
-                f"LR: {optimizer.param_groups[0]['lr']:.2e}, "
-                f"Global Step: {global_step}, "
-                f"Time: {epoch_time:.1f}s"
-            )
-
-        # Early stopping check
-        if config.early_stopping_patience > 0:
-            if epochs_without_improvement >= config.early_stopping_patience:
+            # Validation phase
+            if global_step % config.val_interval == 0 and global_step > 0:
+                val_metrics = validate(model, val_dataloader, accelerator)
                 if accelerator.is_main_process:
-                    logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                break
+                    logger.info(f"Validation metrics at step {global_step}: {val_metrics}")
+                    accelerator.log(val_metrics, step=training_step)
+
+            # Save checkpoint
+            if global_step % config.save_interval == 0 and global_step > 0:
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    training_step=training_step,
+                    global_step=global_step,
+                    checkpoint_dir=checkpoint_dir,
+                    config=config,
+                    accelerator=accelerator,
+                )
+
+            # Update learning rate scheduler (after warmup is complete)
+            if scheduler is not None and global_step >= config.warmup_steps:
+                if isinstance(scheduler, ReduceLROnPlateau):
+                    scheduler.step(metrics['train/loss'])
+                else:
+                    scheduler.step()
 
     # Final save
     accelerator.wait_for_everyone()
     save_checkpoint(
-        model, optimizer, scheduler, config.num_epochs, global_step,
-        epoch_metrics, checkpoint_dir, config, accelerator, is_best=False
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        training_step=training_step,
+        global_step=global_step,
+        checkpoint_dir=checkpoint_dir,
+        config=config,
+        accelerator=accelerator,
     )
 
     # End tracking
@@ -752,6 +708,10 @@ def main():
                         help='Validation split fraction')
     parser.add_argument('--val_size', type=int, default=100,
                         help='Size of validation set (taken after split, to ensure fixed size)')
+    parser.add_argument('--val_interval', type=int, default=500,
+                        help='Validation interval (steps)')
+    parser.add_argument('--max_train_steps', type=int, default=None,
+                        help='Maximum number of training steps (overrides num_epochs if set)')
 
     # Logging configuration
     parser.add_argument('--output_dir', type=str, default='outputs/vqvae',
