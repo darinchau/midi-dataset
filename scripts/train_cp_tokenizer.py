@@ -31,6 +31,7 @@ from typing import Dict, Optional, Tuple
 from src.model.cp_tokenizer import CpConfig, VQVAE, CpDataset, CpDataCollator, get_model
 from src.utils.model import print_model_hierarchy
 from src.utils.gpu_monitor import wait_until_gpu_drops_below_temp
+from src.utils import clear_cuda
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,6 @@ class TrainingConfig:
     # Other configuration
     seed: int
     resume_from: Optional[str]
-    early_stopping_patience: int
     limit_gpu_temp: int | str  # Temperature in Celsius to wait for GPU to cool down
 
     def to_cp_config(self) -> CpConfig:
@@ -152,7 +152,6 @@ class TrainingConfig:
             mixed_precision=args.mixed_precision,
             seed=args.seed,
             resume_from=args.resume_from,
-            early_stopping_patience=args.early_stopping_patience,
             limit_gpu_temp=args.limit_gpu_temp
         )
 
@@ -556,7 +555,6 @@ def train(config: TrainingConfig):
 
     while not stop_training:
         for _, batch in enumerate(progress_bar):
-            torch.cuda.empty_cache()
             wait_until_gpu_drops_below_temp(config.limit_gpu_temp)
 
             # Accelerator handles device placement
@@ -590,7 +588,7 @@ def train(config: TrainingConfig):
             if accelerator.is_local_main_process:
                 current_lr = optimizer.param_groups[0]['lr']
                 progress_bar.set_postfix({
-                    'loss': losses['total_loss'].item(),
+                    'loss': losses['total_loss'].detach().item(),
                     'lr': f'{current_lr:.2e}',
                     'global_step': global_step
                 })
@@ -743,8 +741,6 @@ def main():
                         help='Random seed')
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Resume from checkpoint')
-    parser.add_argument('--early_stopping_patience', type=int, default=0,
-                        help='Early stopping patience (0 to disable)')
     parser.add_argument('--limit_gpu_temp', default=100,
                         help='Temperature in Celsius to wait for GPU to cool down before training '
                         '(defaults to 100 which if your GPU is above 100C you have bigger problems) '

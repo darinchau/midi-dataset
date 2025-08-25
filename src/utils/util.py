@@ -283,3 +283,11 @@ def dynamics_to_velocity(dynamics_tag: str) -> int:
         'fp': 88, 'rfz': 100, 'rf': 100
     }
     return dynamics_map.get(dynamics_tag, 80)  # Default to mezzo-forte
+
+
+def clear_cuda():
+    import torch
+    import gc
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
