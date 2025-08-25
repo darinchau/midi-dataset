@@ -206,7 +206,7 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
     from src.utils import get_all_xml_paths
 
     total_files = len(get_all_xml_paths())
-    val_size = int(total_files * config.val_split)
+    val_size = int(total_files * config.val_split) if config.val_size is None else config.val_size
     train_size = total_files - val_size
 
     # Shuffle files and split
@@ -704,7 +704,7 @@ def main():
     # Data configuration
     parser.add_argument('--val_split', type=float, default=0.1,
                         help='Validation split fraction')
-    parser.add_argument('--val_size', type=int, default=100,
+    parser.add_argument('--val_size', type=int, default=1000,
                         help='Size of validation set (taken after split, to ensure fixed size)')
     parser.add_argument('--val_interval', type=int, default=500,
                         help='Validation interval (steps)')
