@@ -1,5 +1,5 @@
 """
-Training script for VQ-VAE model for MIDI tokenization with HF Accelerate support.
+Training script for VQ-VAE model for MIDI tokenization.
 """
 from __future__ import annotations
 import argparse
@@ -18,10 +18,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
-
-# Import Accelerate
-from accelerate import Accelerator
-from accelerate.utils import set_seed as accelerate_set_seed
+from torch.amp import autocast, GradScaler
 
 import wandb
 from tqdm import tqdm
@@ -80,7 +77,7 @@ class TrainingConfig:
     wandb_tags: Optional[List[str]]
     no_wandb: bool
 
-    # Accelerate configuration
+    # Mixed precision configuration
     mixed_precision: str  # Options: 'no', 'fp16', 'bf16'
 
     # Other configuration
@@ -168,26 +165,22 @@ class TrainingConfig:
         return cls(**config_dict)
 
 
-def setup_logging(log_dir: Path, accelerator: Accelerator):
+def setup_logging(log_dir: Path):
     """Setup logging configuration."""
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Only log on main process
-    if accelerator.is_main_process:
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_dir / 'training.log'),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_dir / 'training.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 
-        # Set subloggers in src to warn and error only
-        for name in ['src.model', 'src.util', 'src.extract', 'src.model.cp_tokenizer']:
-            logging.getLogger(name).setLevel(logging.WARNING)
-    else:
-        logging.basicConfig(level=logging.ERROR)
+    # Set subloggers in src to warn and error only
+    for name in ['src.model', 'src.util', 'src.extract', 'src.model.cp_tokenizer']:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     return logging.getLogger(__name__)
 
@@ -198,8 +191,6 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
@@ -262,14 +253,15 @@ def create_train_val_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, Da
     return train_dataloader, val_dataloader
 
 
-def validate(model: VQVAE, val_dataloader: DataLoader, accelerator: Accelerator) -> Dict[str, float]:
+def validate(model: VQVAE, val_dataloader: DataLoader, device: torch.device, use_amp: bool) -> Dict[str, float]:
     """
     Run validation loop.
 
     Args:
         model: VQVAE model
         val_dataloader: Validation dataloader
-        accelerator: Accelerator instance
+        device: Device to run on
+        use_amp: Whether to use automatic mixed precision
 
     Returns:
         Dictionary of validation metrics
@@ -281,31 +273,29 @@ def validate(model: VQVAE, val_dataloader: DataLoader, accelerator: Accelerator)
     total_perplexity = 0
     num_batches = 0
 
+    # Determine dtype for autocast
+    amp_dtype = torch.float16 if use_amp else None
+
     with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc="Validation", leave=False, disable=not accelerator.is_local_main_process):
-            # No need to move to device, accelerator handles it
-            inputs = batch['input_ids']
-            attention_mask = batch['attention_mask']
+        for batch in tqdm(val_dataloader, desc="Validation", leave=False):
+            # Move to device
+            inputs = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
 
-            # Forward pass
-            reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
-
-            # Compute losses
-            losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask)
-
-            # Gather losses across all processes
-            losses_gathered = accelerator.gather_for_metrics({
-                'total_loss': losses['total_loss'],
-                'recon_loss': losses['recon_loss'],
-                'vq_loss': losses['vq_loss'],
-                'perplexity': perplexity
-            })
+            # Forward pass with or without autocast
+            if use_amp and amp_dtype is not None:
+                with autocast(device_type='cuda', dtype=amp_dtype):
+                    reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
+                    losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask)
+            else:
+                reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
+                losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask)
 
             # Accumulate metrics
-            total_loss += losses_gathered['total_loss'].mean().item()  # type: ignore
-            total_recon_loss += losses_gathered['recon_loss'].mean().item()  # type: ignore
-            total_vq_loss += losses_gathered['vq_loss'].mean().item()  # type: ignore
-            total_perplexity += losses_gathered['perplexity'].mean().item()  # type: ignore
+            total_loss += losses['total_loss'].item()
+            total_recon_loss += losses['recon_loss'].item()
+            total_vq_loss += losses['vq_loss'].item()
+            total_perplexity += perplexity.item()
             num_batches += 1
 
     # Compute averages
@@ -327,7 +317,7 @@ def save_checkpoint(
     global_step: int,
     checkpoint_dir: Path,
     config: TrainingConfig,
-    accelerator: Accelerator,
+    scaler: Optional[GradScaler] = None,
 ):
     """
     Save model checkpoint.
@@ -336,25 +326,18 @@ def save_checkpoint(
         model: Model to save
         optimizer: Optimizer state
         scheduler: Learning rate scheduler state (optional)
-        epoch: Current epoch
+        training_step: Current training step
         global_step: Current global step
         checkpoint_dir: Directory to save checkpoints
         config: Training configuration
-        accelerator: Accelerator instance
+        scaler: GradScaler state (optional)
     """
-    # Only save on main process
-    if not accelerator.is_main_process:
-        return
-
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Unwrap model if wrapped by accelerator
-    unwrapped_model = accelerator.unwrap_model(model)
 
     checkpoint = {
         'training_step': training_step,
         'global_step': global_step,
-        'model_state_dict': unwrapped_model.state_dict(),
+        'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'config': config.to_dict(),
     }
@@ -362,9 +345,12 @@ def save_checkpoint(
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
+    if scaler is not None:
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
+
     # Save regular checkpoint
-    checkpoint_path = checkpoint_dir / f'model_{global_step:5d}.pt'
-    accelerator.save(checkpoint, checkpoint_path)
+    checkpoint_path = checkpoint_dir / f'model_{global_step:05d}.pt'
+    torch.save(checkpoint, checkpoint_path)
 
     # Save config alongside checkpoint
     config.save(checkpoint_dir / 'config.json')
@@ -374,7 +360,7 @@ def save_checkpoint(
 
 def load_checkpoint(checkpoint_path: Path, model: VQVAE,
                     optimizer: Optional[torch.optim.Optimizer] = None,
-                    scheduler=None, accelerator: Optional[Accelerator] = None) -> Tuple[int, int]:
+                    scheduler=None, scaler: Optional[GradScaler] = None) -> Tuple[int, int]:
     """
     Load model checkpoint.
 
@@ -383,25 +369,23 @@ def load_checkpoint(checkpoint_path: Path, model: VQVAE,
         model: Model to load weights into
         optimizer: Optimizer to load state into (optional)
         scheduler: Scheduler to load state into (optional)
-        accelerator: Accelerator instance
+        scaler: GradScaler to load state into (optional)
 
     Returns:
         Tuple of (training step, global step)
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-    # Unwrap model if using accelerator
-    if accelerator is not None:
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'])
 
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     if scheduler is not None and 'scheduler_state_dict' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    if scaler is not None and 'scaler_state_dict' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
     logging.info(f"Loaded checkpoint from {checkpoint_path}")
 
@@ -430,21 +414,16 @@ def get_warmup_lr(base_lr: float, current_step: int, warmup_steps: int) -> float
 
 def train(config: TrainingConfig):
     """
-    Main training loop with Accelerate support.
+    Main training loop.
 
     Args:
         config: Training configuration containing all hyperparameters
     """
-    # Initialize accelerator with mixed precision
-    accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.grad_accumulation_steps,
-        log_with="wandb" if not config.no_wandb else None,
-        project_dir=config.output_dir
-    )
-
     # Setup
-    accelerate_set_seed(config.seed)
+    set_seed(config.seed)
+
+    # Device setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Create directories
     output_dir = Path(config.output_dir)
@@ -452,48 +431,37 @@ def train(config: TrainingConfig):
     log_dir = output_dir / 'logs'
 
     # Setup logging
-    logger = setup_logging(log_dir, accelerator)
+    logger = setup_logging(log_dir)
+    logger.info(f"Starting training with config:")
+    logger.info(json.dumps(config.to_dict(), indent=2))
+    logger.info(f"Using device: {device}")
+    logger.info(f"Mixed precision: {config.mixed_precision}")
 
-    if accelerator.is_main_process:
-        logger.info(f"Starting training with config:")
-        logger.info(json.dumps(config.to_dict(), indent=2))
-        logger.info(f"Using device: {accelerator.device}")
-        logger.info(f"Mixed precision: {config.mixed_precision}")
-        logger.info(f"Num processes: {accelerator.num_processes}")
+    # Save config
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config.save(output_dir / 'config.json')
 
-        # Save config
-        output_dir.mkdir(parents=True, exist_ok=True)
-        config.save(output_dir / 'config.json')
-
-    # Initialize wandb through accelerator
+    # Initialize wandb
     if not config.no_wandb:
-        wandb_config = config.to_dict()
-        accelerator.init_trackers(
-            project_name=config.wandb_project,
-            config=wandb_config,
-            init_kwargs={
-                "wandb": {
-                    "entity": config.wandb_entity,
-                    "name": config.run_name,
-                    "tags": config.wandb_tags,
-                }
-            }
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            name=config.run_name,
+            tags=config.wandb_tags,
+            config=config.to_dict()
         )
 
     # Create model
     cp_config = config.to_cp_config()
     model = get_model(cp_config)
-    model.to(accelerator.device)
+    model.to(device)
     model.train()
 
-    if accelerator.is_main_process:
-        logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Create dataloaders
     train_dataloader, val_dataloader = create_train_val_dataloaders(config)
-
-    if accelerator.is_main_process:
-        logger.info(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
+    logger.info(f"Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
 
     # Create optimizer
     optimizer = optim.AdamW(
@@ -520,46 +488,46 @@ def train(config: TrainingConfig):
             patience=5,
         )
 
-    # Prepare everything with accelerator
-    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader
-    )
+    # Setup mixed precision
+    use_amp = config.mixed_precision != 'no'
+    scaler = GradScaler() if use_amp else None
 
-    if scheduler is not None and config.scheduler != 'plateau':
-        # Only prepare non-ReduceLROnPlateau schedulers
-        scheduler = accelerator.prepare(scheduler)
+    # Determine dtype for autocast
+    if config.mixed_precision == 'bf16':
+        amp_dtype = torch.bfloat16
+    elif config.mixed_precision == 'fp16':
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = None
 
     # Load checkpoint if resuming
-    # Training step: Number of batches processed
-    # Global step: Number of optimizer updates
     training_step = 0
     global_step = 0
     if config.resume_from:
         training_step, global_step = load_checkpoint(
             Path(config.resume_from),
-            model, optimizer, scheduler, accelerator
+            model, optimizer, scheduler, scaler
         )
 
     # Print model hierarchy
-    if accelerator.is_main_process:
-        print_model_hierarchy(model)
+    print_model_hierarchy(model)
 
     # Training loop
     progress_bar = tqdm(
         train_dataloader,
         desc=f"Training model...",
-        disable=not accelerator.is_local_main_process
     )
 
     stop_training = False
+    accumulation_steps = 0
 
     while not stop_training:
         for _, batch in enumerate(progress_bar):
             wait_until_gpu_drops_below_temp(config.limit_gpu_temp)
 
-            # Accelerator handles device placement
-            inputs = batch['input_ids']
-            attention_mask = batch['attention_mask']
+            # Move to device
+            inputs = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
 
             # Learning rate warmup based on global steps
             if global_step < config.warmup_steps:
@@ -567,31 +535,57 @@ def train(config: TrainingConfig):
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = warmup_lr
 
-            with accelerator.accumulate(model):
-                training_step += 1
+            training_step += 1
+
+            # Forward pass with or without autocast
+            if use_amp and amp_dtype is not None:
+                with autocast(device_type='cuda', dtype=amp_dtype):
+                    reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
+                    losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
+                    # Scale loss for gradient accumulation
+                    loss = losses['total_loss'] / config.grad_accumulation_steps
+            else:
                 reconstructed, quantized, vq_loss, perplexity, encoding_indices = model(inputs, attention_mask)
                 losses = model.compute_loss(inputs, reconstructed, vq_loss, attention_mask, beta=config.beta)
-                accelerator.backward(losses['total_loss'])
+                # Scale loss for gradient accumulation
+                loss = losses['total_loss'] / config.grad_accumulation_steps
 
-                # Gradient clipping
-                if config.gradient_clip > 0 and accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            # Backward pass
+            if use_amp and scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-                optimizer.step()
+            accumulation_steps += 1
+
+            # Update weights after gradient accumulation
+            if accumulation_steps >= config.grad_accumulation_steps:
+                if use_amp and scaler is not None:
+                    # Unscale gradients and clip
+                    scaler.unscale_(optimizer)
+                    if config.gradient_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                    # Step optimizer
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Gradient clipping
+                    if config.gradient_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                    optimizer.step()
+
+                clear_cuda()
                 optimizer.zero_grad()
-
-            # Update step
-            if accelerator.sync_gradients:
                 global_step += 1
+                accumulation_steps = 0
 
             # Update progress bar
-            if accelerator.is_local_main_process:
-                current_lr = optimizer.param_groups[0]['lr']
-                progress_bar.set_postfix({
-                    'loss': losses['total_loss'].detach().item(),
-                    'lr': f'{current_lr:.2e}',
-                    'global_step': global_step
-                })
+            current_lr = optimizer.param_groups[0]['lr']
+            progress_bar.set_postfix({
+                'loss': losses['total_loss'].detach().item(),
+                'lr': f'{current_lr:.2e}',
+                'global_step': global_step
+            })
 
             metrics = {
                 'train/loss': losses['total_loss'].item(),
@@ -603,15 +597,17 @@ def train(config: TrainingConfig):
             }
 
             # Log to wandb
-            if global_step % config.log_interval == 0 and accelerator.is_main_process:
-                accelerator.log(metrics, step=training_step)
+            if global_step % config.log_interval == 0 and not config.no_wandb:
+                wandb.log(metrics, step=training_step)
 
             # Validation phase
             if global_step % config.val_interval == 0 and global_step > 0:
-                val_metrics = validate(model, val_dataloader, accelerator)
-                if accelerator.is_main_process:
-                    logger.info(f"Validation metrics at step {global_step}: {val_metrics}")
-                    accelerator.log(val_metrics, step=training_step)
+                val_metrics = validate(model, val_dataloader, device, use_amp)
+                logger.info(f"Validation metrics at step {global_step}: {val_metrics}")
+                if not config.no_wandb:
+                    wandb.log(val_metrics, step=training_step)
+                # Set model back to training mode
+                model.train()
 
             # Save checkpoint
             if global_step % config.save_interval == 0 and global_step > 0:
@@ -623,18 +619,22 @@ def train(config: TrainingConfig):
                     global_step=global_step,
                     checkpoint_dir=checkpoint_dir,
                     config=config,
-                    accelerator=accelerator,
+                    scaler=scaler,
                 )
 
             # Update learning rate scheduler (after warmup is complete)
-            if scheduler is not None and global_step >= config.warmup_steps:
+            if scheduler is not None and global_step >= config.warmup_steps and accumulation_steps == 0:
                 if isinstance(scheduler, ReduceLROnPlateau):
                     scheduler.step(metrics['train/loss'])
                 else:
                     scheduler.step()
 
+            # Check max training steps
+            if config.max_train_steps is not None and global_step >= config.max_train_steps:
+                stop_training = True
+                break
+
     # Final save
-    accelerator.wait_for_everyone()
     save_checkpoint(
         model=model,
         optimizer=optimizer,
@@ -643,14 +643,14 @@ def train(config: TrainingConfig):
         global_step=global_step,
         checkpoint_dir=checkpoint_dir,
         config=config,
-        accelerator=accelerator,
+        scaler=scaler,
     )
 
-    # End tracking
-    accelerator.end_training()
+    # End wandb run
+    if not config.no_wandb:
+        wandb.finish()
 
-    if accelerator.is_main_process:
-        logger.info("Training completed!")
+    logger.info("Training completed!")
 
 
 def main():
@@ -731,7 +731,7 @@ def main():
     parser.add_argument('--no_wandb', action='store_true',
                         help='Disable wandb logging')
 
-    # Accelerate configuration
+    # Mixed precision configuration
     parser.add_argument('--mixed_precision', type=str, default='fp16',
                         choices=['no', 'fp16', 'bf16'],
                         help='Mixed precision training mode')
