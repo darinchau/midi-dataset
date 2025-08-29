@@ -597,11 +597,11 @@ def train(config: TrainingConfig):
             }
 
             # Log to wandb
-            if global_step % config.log_interval == 0 and not config.no_wandb:
+            if training_step % config.log_interval == 0 and not config.no_wandb:
                 wandb.log(metrics, step=training_step)
 
             # Validation phase
-            if global_step % config.val_interval == 0 and global_step > 0:
+            if global_step % config.val_interval == 0 and global_step > 0 and accumulation_steps == 0:
                 val_metrics = validate(model, val_dataloader, device, use_amp)
                 logger.info(f"Validation metrics at step {global_step}: {val_metrics}")
                 if not config.no_wandb:
@@ -610,7 +610,7 @@ def train(config: TrainingConfig):
                 model.train()
 
             # Save checkpoint
-            if global_step % config.save_interval == 0 and global_step > 0:
+            if global_step % config.save_interval == 0 and global_step > 0 and accumulation_steps == 0:
                 save_checkpoint(
                     model=model,
                     optimizer=optimizer,
