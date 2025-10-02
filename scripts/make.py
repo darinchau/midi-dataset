@@ -9,11 +9,11 @@ import json
 import random
 import string
 import tempfile
-import typing
+import typing as t
 from collections import defaultdict
 from threading import Lock
 from multiprocessing import Lock as ProcessLock
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from pathlib import Path
 import pandas as pd
@@ -24,9 +24,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
-ILLEGAL_WINDOWS_NAMES = ("con", "prn", "nul", "aux", "com", "lpt", "lst")
-
 
 class _ExistsAlready(Exception):
     """Custom exception for when a file already exists."""
@@ -101,95 +98,103 @@ def extract_archives(base_path: str, unrar_path: str) -> None:
 
 def find_midi_files(
     base_path: str,
-    exts: tuple[str, ...] = ('.mid', '.midi', '.kar', '.rmi'),
+    exts: tuple[str, ...] = ('.mid', '.midi'),
     verbose: bool = True,
-) -> list[str]:
+) -> t.Generator[str, None, None]:
     """Returns a list of all MIDI files in the directory and subdirectories."""
-    midi_files = []
     midi_files_found = tqdm(desc=" MIDI files found...", unit="file", leave=True, disable=not verbose)
-    non_midi_extensions = set()
     for ext in exts:
         for path in Path(base_path).rglob('*' + ext):
-            midi_files.append(str(path))
+            yield str(path)
             midi_files_found.update(1)
-    for path in Path(base_path).rglob('*'):
-        if path.suffix not in exts and path.is_file():
-            non_midi_extensions.add(path.suffix)
-    if verbose:
-        logging.info(f"Non-MIDI file extensions found: {sorted(non_midi_extensions)}")
     midi_files_found.close()
-    return midi_files
 
 
-def deduplicate_files(root: str, file_paths: list[str], n_processes: int = 1) -> dict:
-    """Remove duplicate files based on file content, adding a progress bar for hashing, and return a mapping of original to new file paths."""
-    def compute_hash(file_path):
-        try:
-            with open(file_path, 'rb') as f:
-                return hashlib.md5(f.read()).hexdigest(), file_path
-        except Exception as e:
-            logging.error(f"Error reading file {file_path}: {e}")
-            return "", file_path
+def compute_hash(file_path: str) -> tuple[str, str]:
+    """Return (file_path, md5hex) or (file_path, '') on error."""
+    try:
+        with open(file_path, 'rb') as f:
+            return file_path, hashlib.md5(f.read()).hexdigest()
+    except Exception as e:
+        logging.error(f"Error reading file {file_path}: {e}")
+        return file_path, ""
 
-    hashes: dict[str, list[str]] = defaultdict(list)
+def deduplicate_files(
+    files: t.Iterable[str],
+    n_processes: int = 1,
+    total: t.Optional[int] = None,
+    use_threads: bool = False,
+) -> t.Generator[t.Tuple[str, str], None, None]:
+    """
+    Consume an iterable/generator of file paths, compute MD5 in parallel,
+    and yield (file_path, hash) for unique contents as soon as ready.
 
-    if n_processes == 0:
-        # Single-threaded hashing
-        for file_path in tqdm(file_paths, desc="Hashing files", unit="file"):
-            file_hash, path = compute_hash(file_path)
-            if file_hash:
-                hashes[file_hash].append(path)
-    else:
-        # Multi-threaded hashing
-        with ThreadPoolExecutor(max_workers=n_processes) as executor:
-            for file_hash, file_path in tqdm(
-                executor.map(compute_hash, file_paths),
-                desc="Hashing files",
-                unit="file",
-                total=len(file_paths)
-            ):
-                if file_hash:
-                    hashes[file_hash].append(file_path)
+    - files: iterable or generator of file paths
+    - n_processes: number of worker processes (0 or 1 -> run in main process)
+    - total: optional count for tqdm progress bar
+    - use_threads: set True to use threads instead of processes
+    """
+    used_hashes = set()
 
-    logging.info(f"Found {len(hashes)} unique file hashes.")
+    # Single-process (no parallelism)
+    if n_processes in (0, 1):
+        for file_path in tqdm(files, total=total, desc="Hashing files", unit="file"):
+            _, file_hash = compute_hash(file_path)
+            if file_hash and file_hash not in used_hashes:
+                used_hashes.add(file_hash)
+                yield file_path, file_hash
+        return
 
-    assert False, "TODO: Implement logic that skips the files that are already in the dataset. Remember to handle hash collisions correctly"
+    # Parallel path: use processes by default, threads if requested
+    ExecutorClass = ProcessPoolExecutor
+    if use_threads:
+        from concurrent.futures import ThreadPoolExecutor
+        ExecutorClass = ThreadPoolExecutor
 
-    def process_collision(hash_val: str, paths: list[str]):
-        local_unique_files: dict[str, str] = {}
-        if any(path in paths_with_deepseek_labels for path in paths):
-            for path in paths:
-                if path in paths_with_deepseek_labels:
-                    local_unique_files[path] = hash_val
-                    break
-        else:
-            first_path = paths[0]
-            local_unique_files[first_path] = hash_val
-        return local_unique_files
+    # We submit tasks as we iterate over files to support generators and limit memory.
+    # Keep a small queue of in-flight futures to avoid overwhelming the system.
+    max_in_flight = max(n_processes * 4, 16)  # modest buffer
+    in_flight = set()
 
-    if n_processes == 0:
-        # Single-threaded collision processing
-        for hash_val, paths in tqdm(hashes.items(), desc="Processing collisions", unit="group"):
-            unique_files.update(process_collision(hash_val, paths))
-    else:
-        # Multi-threaded collision processing
-        with ThreadPoolExecutor(max_workers=n_processes) as executor:
-            results = list(
-                tqdm(
-                    executor.map(lambda item: process_collision(*item), hashes.items()),
-                    desc="Processing collisions",
-                    unit="group",
-                    total=len(hashes),
-                )
-            )
-        for result in results:
-            unique_files.update(result)
-    return unique_files
+    with ExecutorClass(max_workers=n_processes) as executor:
+        pbar = tqdm(desc="Hashing files", unit="file", total=total)
+
+        def drain_completed(block: bool = False):
+            nonlocal in_flight
+            done = []
+            for fut in as_completed(in_flight, timeout=None if block else 0):
+                done.append(fut)
+            for fut in done:
+                in_flight.remove(fut)
+                file_path, file_hash = fut.result()
+                pbar.update(1)
+                if file_hash and file_hash not in used_hashes:
+                    used_hashes.add(file_hash)
+                    yield file_path, file_hash
+
+        # Submit tasks progressively
+        for file_path in files:
+            # throttle submissions
+            while len(in_flight) >= max_in_flight:
+                # yield any completed results without blocking too long
+                yield from drain_completed(block=False)
+                if len(in_flight) >= max_in_flight:
+                    # if still full, block until at least one completes
+                    yield from drain_completed(block=True)
+
+            in_flight.add(executor.submit(compute_hash, file_path))
+
+        # After submissions complete, drain remaining futures
+        while in_flight:
+            yield from drain_completed(block=True)
+
+        pbar.close()
+
+    print(f"Total unique files: {len(used_hashes)}")
 
 
-def make_mapping(unique_files: dict[str, str], csv_file_path: str):
-    assert False, "TODO: evaluate whether we need to handle the case where the mapping csv already exists"
-    mapping = {v: k for k, v in unique_files.items()}
+def make_mapping(deduped_files: t.Iterator[tuple[str, str]], csv_file_path: str):
+    mapping = {index: path for path, index in deduped_files}
     indices: list[str] = sorted(mapping.keys())
     values: list[str] = [mapping[index] for index in indices]
     df = pd.DataFrame({
@@ -197,53 +202,50 @@ def make_mapping(unique_files: dict[str, str], csv_file_path: str):
         "original_path": values
     })
     df.to_csv(csv_file_path, index=False, sep="\t", encoding="utf-8")
+    return mapping
 
 
-def copy_and_rename_files(unique_files: dict[str, str], target_dir: str, name_dir_hierachies: tuple[int, ...]):
-    """Copy files to a new directory with new names and return a mapping of new names to original paths."""
-    for original_path, index in tqdm(unique_files.items(), desc="Copying files", unit="file"):
+def copy_and_rename_files(deduped_files: t.Iterator[tuple[str, str]], target_dir: str, name_dir_hierachies: tuple[int, ...]):
+    """Copy files to a new directory with new names."""
+    for original_path, index in tqdm(deduped_files, desc="Copying files", unit="file"):
         new_name = f"{index}.mid"
         parent_dirs = [index[:i] for i in name_dir_hierachies]
         new_path = os.path.join(target_dir, *parent_dirs, new_name)
-        os.makedirs(os.path.dirname(new_path), exist_ok=True)
-        shutil.copyfile(original_path, new_path)
+        try:
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            shutil.copyfile(original_path, new_path)
+            yield original_path, index
+        except Exception as e:
+            logging.error(f"Error copying file {original_path} to {new_path}: {e}")
 
 
-def main(root: str, target_directory: str, exts: tuple[str, ...], unrar_path: str, name_dir_hierachies: tuple[int, ...], n_processes: int):
+def main(base_directory: str, target_directory: str, exts: tuple[str, ...], unrar_path: str, name_dir_hierachies: tuple[int, ...], n_processes: int):
     """Create a dataset from a directory.
 
     The target directory can be an existing dataset. We will try to process only the new files that are added since the last run.
     The existing labels will be matched to their MD5 hashes and labels will be updated accordingly."""
-    if not os.path.exists(root):
-        raise FileNotFoundError(f"Directory {root} does not exist.")
-    if not os.path.isdir(root):
-        raise NotADirectoryError(f"{root} is not a directory.")
+    if not os.path.exists(base_directory):
+        raise FileNotFoundError(f"Directory {base_directory} does not exist.")
+    if not os.path.isdir(base_directory):
+        raise NotADirectoryError(f"{base_directory} is not a directory.")
 
     csv_file_path = os.path.join(target_directory, "mapping.csv")
-
-    base_directory = "./data"
+    os.makedirs(target_directory, exist_ok=True)
 
     extract_archives(base_directory, unrar_path)
     midi_files = find_midi_files(base_directory, exts=exts)
-    logging.info(f"Found MIDI files: {len(midi_files)}")
-
-    unique_files = deduplicate_files(target_directory, midi_files, n_processes=n_processes)
-    logging.info(f"Unique MIDI files after deduplication: {len(unique_files)}")
-
-    os.makedirs(target_directory, exist_ok=True)
-
-    make_mapping(unique_files, csv_file_path)
+    unique_files = deduplicate_files(midi_files, n_processes=n_processes)
+    unique_files = copy_and_rename_files(unique_files, target_directory, name_dir_hierachies)
+    processed = make_mapping(unique_files, csv_file_path)
     logging.info(f"Mapping saved to CSV file at {csv_file_path}")
-
-    copy_and_rename_files(unique_files, target_directory, name_dir_hierachies)
-    logging.info(f"Files copied and renamed. Total: {len(unique_files)}")
+    logging.info(f"Files copied and renamed. Total: {len(processed)}")
 
 
 if __name__ == "__main__":
     # Example usage
     parser = argparse.ArgumentParser(description="Create a MIDI dataset from a directory.")
-    parser.add_argument("--root", type=str, default="./data", help="Root directory to process.")
-    parser.add_argument("--target_directory", type=str, default="E:/giant-midi-archive", help="Target directory for the dataset.")
+    parser.add_argument("--root", type=str, default="D:/data/raw-midi-data", help="Root directory to process.")
+    parser.add_argument("--target_directory", type=str, default="E:/data/giant-midi-archive", help="Target directory for the dataset.")
     parser.add_argument("--unrar_path", type=str, default="C:/Program Files/WinRAR/UnRAR.exe", help="Path to the UnRAR executable.")
     parser.add_argument("--exts", type=str, nargs="+", default=['.mid', '.midi'], help="MIDI file extensions to include.")
     parser.add_argument("--n_processes", type=int, default=4, help="Number of processes for parallel processing.")
@@ -251,7 +253,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dataset = main(
-        root=args.root,
+        base_directory=args.root,
         target_directory=args.target_directory,
         unrar_path=args.unrar_path,
         exts=tuple(args.exts),
