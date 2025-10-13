@@ -2,10 +2,11 @@ from functools import cache
 from xml.etree.ElementTree import Element
 from ..utils import get_gm_instruments_map
 
+
 @cache
 def get_time_signature_map():
     return {
-        0: "UNK",
+        0: None,
         1: "4/4",
         2: "3/4",
         3: "2/4",
@@ -55,4 +56,3 @@ def dynamics_to_velocity(dynamics_tag: str) -> int:
         'fp': 88, 'rfz': 100, 'rf': 100
     }
     return dynamics_map.get(dynamics_tag, 80)  # Default to mezzo-forte
-

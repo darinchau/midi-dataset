@@ -18,7 +18,10 @@ def element_to_nparray(element: MusicXMLNote):
     if element.barline:
         v[128 + 128 + 15] = 1
         return v
-    time_sig_idx = get_inv_time_signature_map().get(element.timesig, 0)
+    if element.timesig is None:
+        time_sig_idx = 0
+    else:
+        time_sig_idx = get_inv_time_signature_map().get(element.timesig, 0)
     v[element.instrument] = 1
     v[128 + element.pitch] = 1
     v[128 + 128 + time_sig_idx] = 1

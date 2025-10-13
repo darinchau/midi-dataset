@@ -54,26 +54,32 @@ def iterate_dataset(root: str):
             continue
 
 
-def iterate_subset(root: str, subset: str):
+def iterate_subset(root: str, subsets: list[str] | str):
     subset_prefix = {
         "aria": "data/v2/aria-midi-v1-ext",
         "mmd": "data/v2/MMD_MIDI",
         "xmidi": "data/v1/XMIDI_Dataset",
-        "classical": "data/v1/hf-midi-classical-music"
+        "classical": "data/v1/hf-midi-classical-music",
+        "v1": "data/v1",
+        "v2": "data/v2",
+        "all": "data"
     }
 
-    if subset not in subset_prefix:
-        raise ValueError(f"Subset {subset} not recognized. Available subsets: {sorted(subset_prefix.keys())}")
+    if isinstance(subsets, str):
+        subsets = [subsets]
+
+    for subset in subsets:
+        if subset not in subset_prefix:
+            raise ValueError(f"Subset {subset} not recognized. Available subsets: {sorted(subset_prefix.keys())}")
 
     df = pd.read_csv(os.path.join(METADATA_PATH, "mapping.csv"), sep='\t')
     for index in df['index']:
-        if df['mapping'][df['index'] == index].values[0].startswith(subset_prefix[subset]):
+        if any(df[df['index'] == index]['original_path'].values[0].startswith(subset_prefix[s]) for s in subsets):
             try:
                 yield get_path(root, index)
             except FileNotFoundError as e:
                 print(f"File not found for index {index}: {e}")
                 continue
-
 
 
 def iterate_midis():
@@ -249,6 +255,7 @@ def get_gm_instruments_map():
         126: "Applause",
         127: "Gunshot"
     }
+
 
 def clear_cuda():
     import torch

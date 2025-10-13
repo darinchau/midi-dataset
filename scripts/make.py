@@ -25,6 +25,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+
 class _ExistsAlready(Exception):
     """Custom exception for when a file already exists."""
     pass
@@ -118,6 +119,7 @@ def compute_hash(file_path: str) -> tuple[str, str]:
     except Exception as e:
         logging.error(f"Error reading file {file_path}: {e}")
         return file_path, ""
+
 
 def deduplicate_files(
     files: t.Iterable[str],

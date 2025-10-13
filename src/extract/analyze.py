@@ -20,11 +20,11 @@ class MusicXMLNote:
     index: int  # line of fifths index
     octave: int  # Octave number (0-9)
     velocity: int  # MIDI velocity (0-127)
-    timesig: str
+    timesig: str | None  # Time signature as a string, e.g., "4/4", or None if unknown
     barline: bool  # True if this note is not a note but a barline
 
     @classmethod
-    def get_barline(cls, current_time: float, current_timesig: str) -> 'MusicXMLNote':
+    def get_barline(cls, current_time: float, current_timesig: str | None) -> 'MusicXMLNote':
         return cls(
             instrument=-1,
             pitch=0,
@@ -206,7 +206,7 @@ def parse_musicxml(xml_path: str):
                             index=lof_index,
                             octave=octave,
                             velocity=velocity,
-                            timesig=current_time_signature if current_time_signature else "UNK",
+                            timesig=current_time_signature if current_time_signature else None,
                             barline=False
                         )
                         notes_data.append(note)
@@ -238,7 +238,7 @@ def parse_musicxml(xml_path: str):
 
             # Insert BARLINE after each measure
             start_seconds = (current_time / divisions * 60.0) / tempo_bpm
-            notes_data.append(MusicXMLNote.get_barline(start_seconds, current_time_signature if current_time_signature else "UNK"))
+            notes_data.append(MusicXMLNote.get_barline(start_seconds, current_time_signature if current_time_signature else None))
 
     # Count actual notes (excluding barlines)
     actual_notes = [n for n in notes_data if not n.barline]
@@ -276,7 +276,7 @@ def is_valid_xml(xml_path: str) -> bool:
 def fix_time_signature(notes_data: List[MusicXMLNote]) -> List[MusicXMLNote]:
     """
     Fix time signature for each note in the notes_data list.
-    If a note has no time signature, set it to "UNK".
+    If a note has no time signature, set it to None.
     Modifies the notes_data in place and returns the original list with updated note objects
 
     Args:
@@ -304,7 +304,7 @@ def fix_time_signature(notes_data: List[MusicXMLNote]) -> List[MusicXMLNote]:
             if new_timesig in fixes:
                 new_timesig = fixes[new_timesig]
             else:
-                new_timesig = "UNK"
+                new_timesig = None  # Unknown time signature
             assert new_timesig in mapping.values(), f"Invalid time signature: {new_timesig}"
             # This in place modification is explitly stated in the docstring
             object.__setattr__(note, 'timesig', new_timesig)
