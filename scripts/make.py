@@ -196,7 +196,7 @@ def deduplicate_files(
 def make_mapping(deduped_files: t.Iterator[tuple[str, str]], csv_file_path: str):
     mapping = {index: path for path, index in deduped_files}
     indices: list[str] = sorted(mapping.keys())
-    values: list[str] = [mapping[index] for index in indices]
+    values: list[str] = [mapping[index].replace('\\', '/') for index in indices]
     df = pd.DataFrame({
         "index": indices,
         "original_path": values
