@@ -1,3 +1,7 @@
+"""
+Script to copy a subset of MIDI files from one directory to another, filtering out bad files.
+"""
+
 from src.utils import iterate_subset
 import os
 import shutil

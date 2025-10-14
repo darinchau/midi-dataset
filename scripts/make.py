@@ -1,3 +1,7 @@
+"""
+Script to create the MIDI dataset from a collection of MIDI files.
+"""
+
 from __future__ import annotations
 import os
 import logging
