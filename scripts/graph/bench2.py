@@ -8,11 +8,15 @@ from typing import List, Dict, Any
 import bisect
 
 from tqdm import tqdm
-from scripts.bench import construct_music_graph_sliding_window
+from src.graph.make_graph import construct_music_graph as construct_music_graph_sliding_window
 from src.extract import MusicXMLNote
+from src.graph.filter import is_good_midi
 
 import numpy as np
 from typing import List, Dict, Any, Optional, Set
+
+
+TEST_SET_COUNT = 500
 
 
 def construct_music_graph(
@@ -45,8 +49,7 @@ def construct_music_graph(
             note.duration_ql,    # Continuous
             note.index,          # Categorical or continuous
             note.octave,         # Categorical - needs encoding
-            note.velocity,       # Continuous (0-127)
-            1.0 if note.barline else 0.0,  # Binary
+            1.0 if note.velocity > 0 else 0.0,       # Continuous (0-127)
         ]
         node_features.append(features)
 
@@ -124,6 +127,7 @@ def benchmark_graph_construction(notes: List[MusicXMLNote]):
     """Compare performance of different implementations and validate correctness."""
     from src.graph.make_graph import construct_music_graph as construct_music_graph_sliding_window
 
+    notes = [n for n in notes if not n.barline]
     start = time.time()
     graph1 = construct_music_graph(notes)
     t1 = time.time() - start
@@ -141,16 +145,52 @@ def benchmark_graph_construction(notes: List[MusicXMLNote]):
 
     print("All implementations produce identical graphs.")
 
+    return graph3['num_nodes'], graph3['edge_index'].shape[1]
+
 
 def main():
-    test_set_count = 100
-    bar = tqdm(iterate_xmls(), total=test_set_count, desc="Benchmarking graph construction")
-    for i, path in enumerate(bar):
-        if i >= test_set_count:
+    bar = tqdm(total=TEST_SET_COUNT, desc="Benchmarking graph construction")
+    processed = 0
+
+    nodes_to_edges = []
+    for path in iterate_xmls():
+        if processed >= TEST_SET_COUNT:
             break
-        tqdm.write(f"====== Processing {path} (set {i+1}/{test_set_count}) ======")
+        if not is_good_midi(path):
+            continue
         notes = musicxml_to_notes(path)
-        benchmark_graph_construction(notes)
+        if len(notes) > 10000:
+            continue
+        tqdm.write(f"====== Processing {path} (set {processed+1}/{TEST_SET_COUNT}) ======")
+        nnodes, nedges = benchmark_graph_construction(notes)
+        nodes_to_edges.append((nnodes, nedges))
+        processed += 1
+        bar.update(1)
+
+    bar.close()
+
+    # Regression plot
+    import numpy as np
+
+    log_nodes = np.log([n for n, e in nodes_to_edges if n > 0 and e > 0])
+    log_edges = np.log([e for n, e in nodes_to_edges if n > 0 and e > 0])
+    A = np.vstack([log_nodes, np.ones(len(log_nodes))]).T
+    m, c = np.linalg.lstsq(A, log_edges, rcond=None)[0]
+    print(f"Regression line: log(edges) = {m:.2f} * log(nodes) + {c:.2f}")
+    print(f"Which implies: edges = exp({c:.2f}) * nodes^{m:.2f}")
+
+    import matplotlib.pyplot as plt
+    nodes, edges = zip(*nodes_to_edges)
+    plt.figure(figsize=(8, 6))
+    plt.scatter(nodes, edges, alpha=0.6)
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xlabel('Number of Nodes (log scale)')
+    plt.ylabel('Number of Edges (log scale)')
+    plt.title('Graph Size: Nodes vs Edges')
+    plt.grid(True, which="both", ls="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.show()
 
     path = get_path(XML_ROOT, LE_MOLDEAU)
     notes = musicxml_to_notes(path)

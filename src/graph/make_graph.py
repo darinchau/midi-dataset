@@ -1,7 +1,6 @@
 import numpy as np
 from typing import List, Dict, Any, Optional, Set
 from ..extract import MusicXMLNote
-from line_profiler import profile
 
 
 class MusicGraphPreprocessor:
@@ -14,7 +13,6 @@ class MusicGraphPreprocessor:
         self.feature_indices = {}
         self.is_fitted = False
 
-    @profile
     def fit(self, notes: List[MusicXMLNote]):
         """Learn the categorical mappings from the data."""
         # Collect unique values
@@ -31,7 +29,6 @@ class MusicGraphPreprocessor:
         self.is_fitted = True
         return self
 
-    @profile
     def transform_features(
         self,
         node_features: np.ndarray,
@@ -113,7 +110,6 @@ class MusicGraphPreprocessor:
         return np.hstack(transformed_features).astype(np.float32)
 
 
-@profile
 def construct_music_graph(
     notes: List[MusicXMLNote],
     note_velocity_threshold: int = 20,
@@ -215,7 +211,6 @@ def construct_music_graph(
     }
 
 
-@profile
 def create_preprocessed_graph(
     notes: List[MusicXMLNote],
     preprocessor: Optional[MusicGraphPreprocessor] = None,
