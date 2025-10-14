@@ -1,126 +1,7 @@
 import numpy as np
 from typing import List, Dict, Any, Optional, Set
 from ..extract import MusicXMLNote
-
-
-def construct_music_graph(
-    notes: List[MusicXMLNote],
-    include_edge_features: bool = False,
-    note_velocity_threshold: int = 20,
-    remove_barlines: bool = True
-) -> Dict[str, Any]:
-    """
-    Constructs a graph with RAW features. One-hot encoding should be done later.
-    """
-    if not notes:
-        return {
-            'node_features': np.array([]),
-            'edge_index': np.array([[], []]),
-            'edge_attr': np.array([]),
-            'num_nodes': 0,
-            'feature_info': {}
-        }
-
-    # Remove all barlines since we don't care about those for now?
-    if remove_barlines:
-        notes = [note for note in notes if not note.barline]
-
-    num_nodes = len(notes)
-
-    # Extract RAW node features
-    node_features = []
-    for note in notes:
-        features = [
-            note.instrument,        # Categorical
-            note.pitch,             # Categorical
-            note.start,             # Continuous
-            note.duration,          # Continuous
-            note.start_ql,          # Continuous
-            note.duration_ql,       # Continuous
-            note.index,             # Categorical
-            note.octave,            # Categorical
-            1.0 if note.velocity > note_velocity_threshold else 0.0,  # Binary
-        ]
-        if not remove_barlines:
-            features.append(1.0 if note.barline else 0.0)  # Binary, only add if barlines are kept
-        node_features.append(features)
-
-    node_features = np.array(node_features, dtype=np.float32)
-
-    # Store metadata about features for later preprocessing
-    feature_info = {
-        'feature_names': [
-            'instrument', 'pitch', 'start', 'duration',
-            'start_ql', 'duration_ql', 'index', 'octave',
-            'velocity'
-        ],
-        'categorical_features': ['instrument', 'octave', 'pitch', 'index'],
-        'continuous_features': ['start', 'duration', 'start_ql', 'duration_ql'],
-        'binary_features': ['velocity']
-    }
-    if not remove_barlines:
-        feature_info['feature_names'].append('barline')
-        feature_info['binary_features'].append('barline')
-
-    # Construct edges (same as before)
-    edge_sources = []
-    edge_targets = []
-    edge_weights = []
-    edge_features = []
-
-    for i in range(num_nodes):
-        for j in range(num_nodes):
-            if i != j:
-                onset_a = notes[i].start
-                onset_b = notes[j].start
-
-                if onset_a > onset_b:
-                    continue
-
-                time_diff = onset_b - onset_a
-                weight = max(1.0 - time_diff / 10.0, 0.0)
-
-                if weight <= 0:
-                    continue
-
-                edge_sources.append(i)
-                edge_targets.append(j)
-                edge_weights.append(weight)
-
-                if not include_edge_features:
-                    continue
-
-                # Additional edge features if needed
-                edge_feat = [
-                    time_diff,  # Time difference
-                    notes[j].pitch - notes[i].pitch,  # Pitch interval
-                    notes[j].octave - notes[i].octave,  # Octave difference
-                ]
-                edge_features.append(edge_feat)
-
-    # Convert to arrays
-    if edge_sources:
-        edge_index = np.array([edge_sources, edge_targets], dtype=np.int64)
-        edge_attr = np.array(edge_weights, dtype=np.float32)
-        if include_edge_features:
-            edge_features = np.array(edge_features, dtype=np.float32)
-    else:
-        edge_index = np.array([[], []], dtype=np.int64)
-        edge_attr = np.array([], dtype=np.float32)
-        edge_features = np.array([], dtype=np.float32) if include_edge_features else None
-
-    result = {
-        'node_features': node_features,
-        'edge_index': edge_index,
-        'edge_attr': edge_attr,
-        'num_nodes': num_nodes,
-        'feature_info': feature_info
-    }
-
-    if include_edge_features and edge_features is not None:
-        result['edge_features'] = edge_features
-
-    return result
+from line_profiler import profile
 
 
 class MusicGraphPreprocessor:
@@ -133,9 +14,11 @@ class MusicGraphPreprocessor:
         self.feature_indices = {}
         self.is_fitted = False
 
+    @profile
     def fit(self, notes: List[MusicXMLNote]):
         """Learn the categorical mappings from the data."""
         # Collect unique values
+        # Can hardcode but use dynamic for potentially smaller model sizes later?
         instruments = set(note.instrument for note in notes)
         octaves = set(note.octave for note in notes)
         pitches = set(note.pitch for note in notes)
@@ -148,6 +31,7 @@ class MusicGraphPreprocessor:
         self.is_fitted = True
         return self
 
+    @profile
     def transform_features(
         self,
         node_features: np.ndarray,
@@ -229,20 +113,170 @@ class MusicGraphPreprocessor:
         return np.hstack(transformed_features).astype(np.float32)
 
 
-# Example usage with preprocessing
-def create_preprocessed_graph(notes: List[MusicXMLNote],
-                              preprocessor: Optional[MusicGraphPreprocessor] = None) -> Dict[str, Any]:
+@profile
+def construct_music_graph(
+    notes: List[MusicXMLNote],
+    include_edge_features: bool = False,
+    note_velocity_threshold: int = 20,
+    remove_barlines: bool = True,
+    max_seconds_apart: float = 10.0,
+) -> Dict[str, Any]:
+    """
+    Constructs a graph with RAW features. One-hot encoding should be done later.
+    Args:
+        notes: List of MusicXMLNote objects.
+        include_edge_features: Whether to include additional edge features.
+        note_velocity_threshold: Velocity threshold to consider a note as "on".
+        remove_barlines: Whether to remove barline notes from the graph.
+        max_seconds_apart: Maximum time difference to connect notes with edges.
+    """
+    if not notes:
+        return {
+            'node_features': np.array([]),
+            'edge_index': np.array([[], []]),
+            'edge_attr': np.array([]),
+            'num_nodes': 0,
+            'feature_info': {}
+        }
+
+    # Remove all barlines since we don't care about those for now?
+    if remove_barlines:
+        notes = [note for note in notes if not note.barline]
+
+    num_nodes = len(notes)
+
+    # Extract RAW node features
+    node_features = []
+    for note in notes:
+        features = [
+            note.instrument,        # Categorical
+            note.pitch,             # Categorical
+            note.start,             # Continuous
+            note.duration,          # Continuous
+            note.start_ql,          # Continuous
+            note.duration_ql,       # Continuous
+            note.index,             # Categorical
+            note.octave,            # Categorical
+            1.0 if note.velocity > note_velocity_threshold else 0.0,  # Binary
+        ]
+        if not remove_barlines:
+            features.append(1.0 if note.barline else 0.0)  # Binary, only add if barlines are kept
+        node_features.append(features)
+
+    node_features = np.array(node_features, dtype=np.float32)
+
+    # Store metadata about features for later preprocessing
+    feature_info = {
+        'feature_names': [
+            'instrument', 'pitch', 'start', 'duration',
+            'start_ql', 'duration_ql', 'index', 'octave',
+            'velocity'
+        ],
+        'categorical_features': ['instrument', 'octave', 'pitch', 'index'],
+        'continuous_features': ['start', 'duration', 'start_ql', 'duration_ql'],
+        'binary_features': ['velocity']
+    }
+    if not remove_barlines:
+        feature_info['feature_names'].append('barline')
+        feature_info['binary_features'].append('barline')
+
+    indexed_notes = [(i, note) for i, note in enumerate(notes)]
+    indexed_notes.sort(key=lambda x: x[1].start)
+
+    edge_sources = []
+    edge_targets = []
+    edge_weights = []
+    edge_features = []
+
+    # Use two pointers for sliding window
+    left = 0
+
+    for right in range(len(indexed_notes)):
+        right_idx, right_note = indexed_notes[right]
+
+        # Move left pointer to maintain window
+        while left < right and indexed_notes[left][1].start < right_note.start - max_seconds_apart:
+            left += 1
+
+        # Add edges from all notes in window to current note
+        for i in range(left, right):
+            left_idx, left_note = indexed_notes[i]
+
+            time_diff = right_note.start - left_note.start
+            weight = max(1.0 - time_diff / max_seconds_apart, 0.0)
+
+            if weight > 0:
+                edge_sources.append(left_idx)
+                edge_targets.append(right_idx)
+                edge_weights.append(weight)
+                if include_edge_features:
+                    edge_feat = [
+                        time_diff,                          # Time difference
+                        right_note.pitch - left_note.pitch,  # Pitch difference
+                        right_note.octave - left_note.octave,  # Octave difference
+                    ]
+                    edge_features.append(edge_feat)
+
+        # Handle same-time notes
+        # Look ahead for notes at the same time
+        j = right + 1
+        while j < len(indexed_notes) and indexed_notes[j][1].start == right_note.start:
+            other_idx = indexed_notes[j][0]
+            # Add bidirectional edges for same-time notes
+            edge_sources.extend([right_idx, other_idx])
+            edge_targets.extend([other_idx, right_idx])
+            edge_weights.extend([1.0, 1.0])
+            j += 1
+
+    # Convert to arrays
+    if edge_sources:
+        edge_index = np.array([edge_sources, edge_targets], dtype=np.int64)
+        edge_attr = np.array(edge_weights, dtype=np.float32)
+        if include_edge_features:
+            edge_features = np.array(edge_features, dtype=np.float32)
+    else:
+        edge_index = np.array([[], []], dtype=np.int64)
+        edge_attr = np.array([], dtype=np.float32)
+        edge_features = np.array([], dtype=np.float32) if include_edge_features else None
+
+    result = {
+        'node_features': node_features,
+        'edge_index': edge_index,
+        'edge_attr': edge_attr,
+        'num_nodes': num_nodes,
+        'feature_info': feature_info
+    }
+
+    if include_edge_features and edge_features is not None:
+        result['edge_features'] = edge_features
+
+    return result
+
+
+@profile
+def create_preprocessed_graph(
+    notes: List[MusicXMLNote],
+    preprocessor: Optional[MusicGraphPreprocessor] = None,
+    *,
+    include_edge_features: bool = False,
+    note_velocity_threshold: int = 20,
+    remove_barlines: bool = True,
+    max_seconds_apart: float = 10.0,
+) -> Dict[str, Any]:
     """Create graph with preprocessed features."""
 
-    # Create raw graph
-    graph = construct_music_graph(notes)
+    graph = construct_music_graph(
+        notes,
+        include_edge_features=include_edge_features,
+        note_velocity_threshold=note_velocity_threshold,
+        remove_barlines=remove_barlines,
+        max_seconds_apart=max_seconds_apart
+    )
 
-    # Create or use provided preprocessor
     if preprocessor is None:
         preprocessor = MusicGraphPreprocessor()
         preprocessor.fit(notes)
 
-    # Transform features
     graph['node_features'] = preprocessor.transform_features(
         graph['node_features'],
         graph['feature_info'],

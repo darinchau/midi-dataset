@@ -3,8 +3,8 @@ from typing import List, Optional
 from ..extract import musicxml_to_notes, MusicXMLNote
 
 
-def is_good_midi(file_path: str) -> str:
-    """Attempt to get the cleanest XMLs from within our dataset."""
+def get_bad_midi_reason(file_path: str) -> str:
+    """Attempt to get the cleanest XMLs from within our dataset. Returns empty string if good, otherwise a reason for rejection."""
     try:
         notes = musicxml_to_notes(file_path, no_barline=True)
     except Exception as e:
@@ -41,3 +41,8 @@ def is_good_midi(file_path: str) -> str:
         return "InvalidInstrument"
 
     return ""
+
+
+def is_good_midi(file_path: str) -> bool:
+    """Returns True if the MIDI file is considered good based on our filtering criteria."""
+    return not get_bad_midi_reason(file_path)

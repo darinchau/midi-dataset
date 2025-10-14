@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from typing import List
 from .utils import get_text_or_raise, get_inv_gm_instruments_map, dynamics_to_velocity, get_time_signature_map
+from ..utils import get_gm_instruments_map
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,21 @@ class MusicXMLNote:
         if self.barline:
             return -1
         return 12 * (self.octave + 1) + ([0, 7, 2, 9, 4, 11, 5][self.index % 7] + (self.index + 1) // 7)
+
+    @property
+    def name(self):
+        """Return the note name in scientific pitch notation, e.g., C4, A#3."""
+        if self.barline:
+            return "BARLINE"
+        step, alter = _lof_index_to_step_alter(self.index)
+        pitch_class = step
+        if alter < 0:
+            pitch_class += 'b' * (-alter)
+        elif alter > 0:
+            pitch_class += '#' * alter  # Don't bother with double sharp symbols
+
+        instrument_name = get_gm_instruments_map().get(self.instrument, "Unknown")
+        return f"{pitch_class}{self.octave} ({instrument_name}={self.instrument})"
 
 
 def _step_alter_to_lof_index(step: str, alter: int) -> int:

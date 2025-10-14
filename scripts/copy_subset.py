@@ -2,7 +2,7 @@ from src.utils import iterate_subset
 import os
 import shutil
 from tqdm import tqdm
-from src.graph.filter import is_good_midi
+from src.graph.filter import get_bad_midi_reason
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
             tqdm.write(f"File already exists, skipping: {new_file_path}")
             continue
 
-        rejection_reason = is_good_midi(file_path)
+        rejection_reason = get_bad_midi_reason(file_path)
         if rejection_reason:
             tqdm.write(f"Skipping bad MIDI file: {file_path} ({rejection_reason})")
             continue
