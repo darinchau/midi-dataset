@@ -127,7 +127,6 @@ class MusicGraphPreprocessor:
 
 def construct_music_graph(
     notes: List[MusicXMLNote],
-    note_velocity_threshold: int = 20,
     remove_barlines: bool = True,
     max_seconds_apart: float = 10.0,
 ) -> NoteGraph:
@@ -135,7 +134,6 @@ def construct_music_graph(
     Constructs a graph with RAW features. One-hot encoding should be done later.
     Args:
         notes: List of MusicXMLNote objects.
-        note_velocity_threshold: Velocity threshold to consider a note as "on".
         remove_barlines: Whether to remove barline notes from the graph.
         max_seconds_apart: Maximum time difference to connect notes with edges.
     """
@@ -164,7 +162,6 @@ def construct_music_graph(
             note.duration_ql,       # Continuous
             note.index,             # Categorical
             note.octave,            # Categorical
-            1.0 if note.velocity > note_velocity_threshold else 0.0,  # Binary
         ]
         if not remove_barlines:
             features.append(1.0 if note.barline else 0.0)  # Binary, only add if barlines are kept
@@ -207,15 +204,13 @@ def construct_music_graph(
         'feature_names': [
             'instrument', 'pitch', 'start', 'duration',
             'start_ql', 'duration_ql', 'index', 'octave',
-            'velocity'
-        ],
+        ] + (['barline'] if not remove_barlines else []),
         'categorical_features': ['instrument', 'octave', 'pitch', 'index'],
         'continuous_features': ['start', 'duration', 'start_ql', 'duration_ql'],
-        'binary_features': ['velocity']
     }
     if not remove_barlines:
         feature_info['feature_names'].append('barline')
-        feature_info['binary_features'].append('barline')
+        feature_info['binary_features'] = ['barline']
 
     return NoteGraph(
         node_features=node_features,
@@ -230,16 +225,13 @@ def create_preprocessed_graph(
     notes: List[MusicXMLNote],
     preprocessor: Optional[MusicGraphPreprocessor] = None,
     *,
-    note_velocity_threshold: int = 20,
-    remove_barlines: bool = True,
     max_seconds_apart: float = 10.0,
 ) -> NoteGraph:
     """Create graph with preprocessed features."""
 
     graph = construct_music_graph(
         notes,
-        note_velocity_threshold=note_velocity_threshold,
-        remove_barlines=remove_barlines,
+        remove_barlines=True,
         max_seconds_apart=max_seconds_apart
     )
 
