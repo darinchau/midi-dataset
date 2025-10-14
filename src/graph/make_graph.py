@@ -1,6 +1,21 @@
 import numpy as np
 from typing import List, Dict, Any, Optional, Set
-from ..extract import MusicXMLNote
+from ..extract import MusicXMLNote  # Converts the graph to PyG Data format
+
+import torch
+from torch_geometric.data import Data
+
+from dataclasses import dataclass
+
+
+@dataclass
+class NoteGraph:
+    """Data structure for a music note graph."""
+    node_features: np.ndarray  # Shape: [num_nodes, num_features]
+    edge_index: np.ndarray     # Shape: [2, num_edges]
+    edge_attr: np.ndarray      # Shape: [num_edges, num_edge_features]
+    num_nodes: int
+    feature_info: Dict[str, Any]  # Metadata about features
 
 
 class MusicGraphPreprocessor:
@@ -115,7 +130,7 @@ def construct_music_graph(
     note_velocity_threshold: int = 20,
     remove_barlines: bool = True,
     max_seconds_apart: float = 10.0,
-) -> Dict[str, Any]:
+) -> NoteGraph:
     """
     Constructs a graph with RAW features. One-hot encoding should be done later.
     Args:
@@ -125,13 +140,13 @@ def construct_music_graph(
         max_seconds_apart: Maximum time difference to connect notes with edges.
     """
     if not notes:
-        return {
-            'node_features': np.array([]),
-            'edge_index': np.array([[], []]),
-            'edge_attr': np.array([]),
-            'num_nodes': 0,
-            'feature_info': {}
-        }
+        return NoteGraph(
+            node_features=np.array([]),
+            edge_index=np.array([[], []]),
+            edge_attr=np.array([]),
+            num_nodes=0,
+            feature_info={}
+        )
 
     # Remove all barlines since we don't care about those for now?
     if remove_barlines:
@@ -202,13 +217,13 @@ def construct_music_graph(
         feature_info['feature_names'].append('barline')
         feature_info['binary_features'].append('barline')
 
-    return {
-        'node_features': node_features,
-        'edge_index': edge_index,
-        'edge_attr': edge_attr,
-        'num_nodes': num_nodes,
-        'feature_info': feature_info
-    }
+    return NoteGraph(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        num_nodes=num_nodes,
+        feature_info=feature_info
+    )
 
 
 def create_preprocessed_graph(
@@ -218,7 +233,7 @@ def create_preprocessed_graph(
     note_velocity_threshold: int = 20,
     remove_barlines: bool = True,
     max_seconds_apart: float = 10.0,
-) -> Dict[str, Any]:
+) -> NoteGraph:
     """Create graph with preprocessed features."""
 
     graph = construct_music_graph(
@@ -232,11 +247,33 @@ def create_preprocessed_graph(
         preprocessor = MusicGraphPreprocessor()
         preprocessor.fit(notes)
 
-    graph['node_features'] = preprocessor.transform_features(
-        graph['node_features'],
-        graph['feature_info'],
+    processed_features = preprocessor.transform_features(
+        graph.node_features,
+        graph.feature_info,
         one_hot_categoricals=True,
         normalize_continuous=True
     )
 
-    return graph
+    return NoteGraph(
+        node_features=processed_features,
+        edge_index=graph.edge_index,
+        edge_attr=graph.edge_attr,
+        num_nodes=graph.num_nodes,
+        feature_info=graph.feature_info
+    )
+
+
+def dict_to_pyg_data(graph: NoteGraph):
+    """Convert dictionary format to PyTorch Geometric Data object"""
+    node_features = torch.tensor(graph.node_features, dtype=torch.float32)
+    edge_index = torch.tensor(graph.edge_index, dtype=torch.long)
+    edge_attr = torch.tensor(graph.edge_attr, dtype=torch.float32)
+
+    data = Data(
+        x=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        num_nodes=graph.num_nodes
+    )
+
+    return data
