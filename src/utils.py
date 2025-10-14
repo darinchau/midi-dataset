@@ -73,8 +73,10 @@ def iterate_subset(root: str, subsets: list[str] | str):
             raise ValueError(f"Subset {subset} not recognized. Available subsets: {sorted(subset_prefix.keys())}")
 
     df = pd.read_csv(os.path.join(METADATA_PATH, "mapping.csv"), sep='\t')
-    for index in df['index']:
-        if any(df[df['index'] == index]['original_path'].values[0].startswith(subset_prefix[s]) for s in subsets):
+    for _, row in df.iterrows():
+        index = row['index']
+        mapping_value = row['original_path']
+        if any(mapping_value.startswith(subset_prefix[s]) for s in subsets):
             try:
                 yield get_path(root, index)
             except FileNotFoundError as e:

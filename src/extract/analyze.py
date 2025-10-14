@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class MusicXMLNote:
     instrument: int
-    pitch: int  # MIDI pitch number (0-127)
     start: float  # seconds from beginning of the piece
     duration: float  # seconds
     start_ql: float  # quarter notes from start of the bar
@@ -27,7 +26,6 @@ class MusicXMLNote:
     def get_barline(cls, current_time: float, current_timesig: str | None) -> 'MusicXMLNote':
         return cls(
             instrument=-1,
-            pitch=0,
             start=current_time,
             duration=0.0,
             start_ql=0.0,
@@ -52,9 +50,13 @@ class MusicXMLNote:
             raise ValueError("Start and duration must be non-negative")
         if not (0 <= self.velocity <= 127):
             raise ValueError(f"Invalid velocity: {self.velocity}")
-        calculated_pitch = 12 * (self.octave + 1) + ([0, 7, 2, 9, 4, 11, 5][self.index % 7] + (self.index + 1) // 7)
-        if not self.barline and calculated_pitch != self.pitch:
-            raise ValueError(f"Pitch {self.pitch} does not match calculated pitch {calculated_pitch}")
+
+    @property
+    def pitch(self):
+        """Return the MIDI pitch number. A0 is 21 and C8 is 108. Barlines are 0."""
+        if self.barline:
+            return -1
+        return 12 * (self.octave + 1) + ([0, 7, 2, 9, 4, 11, 5][self.index % 7] + (self.index + 1) // 7)
 
 
 def _step_alter_to_lof_index(step: str, alter: int) -> int:
@@ -161,10 +163,6 @@ def parse_musicxml(xml_path: str):
                         alter_elem = pitch_elem.find('alter')
                         alter = int(get_text_or_raise(alter_elem)) if alter_elem is not None else 0
 
-                        # Convert to MIDI note number
-                        note_map = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
-                        midi_note = 12 * (octave + 1) + note_map[step] + alter
-
                         # Get duration
                         duration_elem = element.find('duration')
                         duration_ticks = int(get_text_or_raise(duration_elem))
@@ -198,7 +196,6 @@ def parse_musicxml(xml_path: str):
 
                         note = MusicXMLNote(
                             instrument=current_instrument,
-                            pitch=midi_note,
                             start=start_seconds,
                             duration=duration_seconds,
                             start_ql=onset_quarters_from_bar,
@@ -312,12 +309,13 @@ def fix_time_signature(notes_data: List[MusicXMLNote]) -> List[MusicXMLNote]:
     return notes_data
 
 
-def musicxml_to_notes(xml_path: str) -> List[MusicXMLNote]:
+def musicxml_to_notes(xml_path: str, no_barline: bool = False) -> List[MusicXMLNote]:
     """
     Parse a MusicXML file and return a list of MusicXMLNote objects.
 
     Args:
         xml_path (str): Path to the MusicXML file.
+        no_barline (bool): If True, remove barline notes from the output list.
 
     Returns:
         List[MusicXMLNote]: List of MusicXMLNote objects parsed from the file.
@@ -331,7 +329,8 @@ def musicxml_to_notes(xml_path: str) -> List[MusicXMLNote]:
     for note in notes:
         if note.barline:
             if current_barline is None or current_barline.start != note.start:
-                new_notes.append(note)
+                if not no_barline:
+                    new_notes.append(note)
                 current_barline = note
         else:
             new_notes.append(note)
