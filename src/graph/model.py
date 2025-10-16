@@ -9,6 +9,8 @@ import numpy as np
 from torch import Tensor
 from typing import Optional, Tuple, Dict, List
 
+from src.graph.filter import MIDIFilterCriterion
+
 
 class AttentionalReadout(nn.Module):
     """Attention-based graph readout layer"""
@@ -208,16 +210,28 @@ if __name__ == "__main__":
     print("Edge index shape:", graph.edge_index.shape)
     print("Edge attributes shape:", graph.edge_attr.shape)
 
+    normalizer = MIDIFilterCriterion()
+    graph = normalizer.normalize(graph)
     data = graph_to_pyg_data(graph)
+
+    permitted_instruments = normalizer.permitted_instruments()
+    permitted_octaves = normalizer.permitted_octaves()
+    permitted_pitch = normalizer.permitted_pitch()
+    permitted_index = normalizer.permitted_index()
+
+    print("Permitted instruments:", permitted_instruments)
+    print("Permitted octaves:", permitted_octaves)
+    print("Permitted pitch:", permitted_pitch)
+    print("Permitted index:", permitted_index)
 
     # Initialize the model
     model = SymMusicMotifGNN(
         hidden_dim=64,
         output_dim=192,
-        num_instruments=8,
-        num_octaves=12,
-        num_pitches=128,
-        num_indices=16,
+        num_instruments=len(permitted_instruments),
+        num_octaves=len(permitted_octaves),
+        num_pitches=len(permitted_pitch),
+        num_indices=len(permitted_index),
         instrument_emb_dim=8,
         octave_emb_dim=4,
         pitch_emb_dim=16,
@@ -228,3 +242,6 @@ if __name__ == "__main__":
     print(sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters")
 
     output = model(data.x, data.edge_index)
+
+    print("Output shape:", output.shape)
+    print("Output:", output.tolist())
