@@ -6,7 +6,7 @@ from src.utils import iterate_subset
 import os
 import shutil
 from tqdm import tqdm
-from src.graph.filter import get_bad_midi_reason
+from src.extract.filter import get_bad_midi_reason
 
 
 def main():

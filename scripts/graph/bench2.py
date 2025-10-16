@@ -10,7 +10,7 @@ import bisect
 from tqdm import tqdm
 from src.graph.make_graph import construct_music_graph as construct_music_graph_sliding_window
 from src.extract import MusicXMLNote
-from src.graph.filter import is_good_midi
+from src.extract.filter import is_good_midi
 
 import numpy as np
 from typing import List, Dict, Any, Optional, Set
@@ -136,16 +136,16 @@ def benchmark_graph_construction(notes: List[MusicXMLNote]):
     start = time.time()
     graph3 = construct_music_graph_sliding_window(notes)
     t3 = time.time() - start
-    print(f"Vectorized approach took {t3:.4f} seconds with {graph3['num_nodes']} nodes and {graph3['edge_index'].shape[1]} edges.")
+    print(f"Vectorized approach took {t3:.4f} seconds with {graph3.num_nodes} nodes and {graph3.edge_index.shape[1]} edges.")
 
     # Validate that all graphs are identical
-    assert np.array_equal(graph1['node_features'], graph3['node_features'])
-    assert np.array_equal(graph1['edge_index'], graph3['edge_index'])
-    assert np.allclose(graph1['edge_attr'], graph3['edge_attr'])
+    assert np.array_equal(graph1['node_features'], graph3.node_features)
+    assert np.array_equal(graph1['edge_index'], graph3.edge_index)
+    assert np.allclose(graph1['edge_attr'], graph3.edge_attr)
 
     print("All implementations produce identical graphs.")
 
-    return graph3['num_nodes'], graph3['edge_index'].shape[1]
+    return graph3.num_nodes, graph3.edge_index.shape[1]
 
 
 def main():
@@ -198,7 +198,7 @@ def main():
     start = time.time()
     graph3 = construct_music_graph_sliding_window(notes)
     t3 = time.time() - start
-    print(f"Vectorized approach took {t3:.4f} seconds with {graph3['num_nodes']} nodes and {graph3['edge_index'].shape[1]} edges.")
+    print(f"Vectorized approach took {t3:.4f} seconds with {graph3.num_nodes} nodes and {graph3.edge_index.shape[1]} edges.")
 
 
 if __name__ == "__main__":

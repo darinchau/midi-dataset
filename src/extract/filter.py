@@ -1,6 +1,6 @@
 # Stores the filter function we use to get clean XMLs in the current phase of training
 from typing import List, Optional
-from ..extract import musicxml_to_notes, MusicXMLNote
+from . import musicxml_to_notes, MusicXMLNote
 
 
 def get_bad_midi_reason(file_path: str) -> str:

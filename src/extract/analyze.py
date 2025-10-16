@@ -139,6 +139,9 @@ def parse_musicxml(xml_path: str):
         current_time = 0
         measure_number = 0
 
+        # Dictionary to track ongoing tied notes: key is (pitch, octave, alter)
+        tied_notes = {}
+
         for measure in part.findall('.//measure'):
             measure_number += 1
             measure_start_time = current_time  # Track start of measure
@@ -206,23 +209,73 @@ def parse_musicxml(xml_path: str):
                         duration_seconds = (duration_quarters * 60.0) / tempo_bpm
                         start_seconds = (current_time / divisions * 60.0) / tempo_bpm
 
-                        # Add note data as tuple
                         # Calculate line of fifths index
                         lof_index = _step_alter_to_lof_index(step, alter)
 
-                        note = MusicXMLNote(
-                            instrument=current_instrument,
-                            start=start_seconds,
-                            duration=duration_seconds,
-                            start_ql=onset_quarters_from_bar,
-                            duration_ql=duration_quarters,
-                            index=lof_index,
-                            octave=octave,
-                            velocity=velocity,
-                            timesig=current_time_signature if current_time_signature else None,
-                            barline=False
-                        )
-                        notes_data.append(note)
+                        # Create a key for tracking tied notes
+                        note_key = (step, octave, alter)
+
+                        # Check for tie elements
+                        tie_start = False
+                        tie_stop = False
+                        for tie in element.findall('.//tie'):
+                            tie_type = tie.get('type')
+                            if tie_type == 'start':
+                                tie_start = True
+                            elif tie_type == 'stop':
+                                tie_stop = True
+
+                        # Handle tied notes
+                        if tie_stop and note_key in tied_notes:
+                            # This note ends a tie - add its duration to the ongoing tied note
+                            tied_note_data = tied_notes[note_key]
+                            tied_note_data['duration_ticks'] += duration_ticks
+                            tied_note_data['duration_quarters'] += duration_quarters
+                            tied_note_data['duration_seconds'] += duration_seconds
+
+                            if not tie_start:
+                                # This is the end of the tie - create the combined note
+                                note = MusicXMLNote(
+                                    instrument=current_instrument,
+                                    start=tied_note_data['start_seconds'],
+                                    duration=tied_note_data['duration_seconds'],
+                                    start_ql=tied_note_data['onset_quarters_from_bar'],
+                                    duration_ql=tied_note_data['duration_quarters'],
+                                    index=lof_index,
+                                    octave=octave,
+                                    velocity=tied_note_data['velocity'],
+                                    timesig=tied_note_data['timesig'],
+                                    barline=False
+                                )
+                                notes_data.append(note)
+                                # Remove from tied notes tracking
+                                del tied_notes[note_key]
+                        elif tie_start and not tie_stop:
+                            # This note starts a new tie - store it for later
+                            tied_notes[note_key] = {
+                                'start_seconds': start_seconds,
+                                'duration_seconds': duration_seconds,
+                                'onset_quarters_from_bar': onset_quarters_from_bar,
+                                'duration_quarters': duration_quarters,
+                                'duration_ticks': duration_ticks,
+                                'velocity': velocity,
+                                'timesig': current_time_signature if current_time_signature else None
+                            }
+                        elif not tie_start and not tie_stop:
+                            # Regular note (not tied)
+                            note = MusicXMLNote(
+                                instrument=current_instrument,
+                                start=start_seconds,
+                                duration=duration_seconds,
+                                start_ql=onset_quarters_from_bar,
+                                duration_ql=duration_quarters,
+                                index=lof_index,
+                                octave=octave,
+                                velocity=velocity,
+                                timesig=current_time_signature if current_time_signature else None,
+                                barline=False
+                            )
+                            notes_data.append(note)
 
                     # Update time if not a chord
                     if element.find('chord') is None and element.find('duration') is not None:
@@ -252,6 +305,27 @@ def parse_musicxml(xml_path: str):
             # Insert BARLINE after each measure
             start_seconds = (current_time / divisions * 60.0) / tempo_bpm
             notes_data.append(MusicXMLNote.get_barline(start_seconds, current_time_signature if current_time_signature else None))
+
+        # Check for any unresolved tied notes (shouldn't happen in valid MusicXML)
+        if tied_notes:
+            logger.warning(f"Found {len(tied_notes)} unresolved tied notes in part {part_id}")
+            # Optionally create notes for them anyway
+            for note_key, tied_note_data in tied_notes.items():
+                step, octave, alter = note_key
+                lof_index = _step_alter_to_lof_index(step, alter)
+                note = MusicXMLNote(
+                    instrument=current_instrument,
+                    start=tied_note_data['start_seconds'],
+                    duration=tied_note_data['duration_seconds'],
+                    start_ql=tied_note_data['onset_quarters_from_bar'],
+                    duration_ql=tied_note_data['duration_quarters'],
+                    index=lof_index,
+                    octave=octave,
+                    velocity=tied_note_data['velocity'],
+                    timesig=tied_note_data['timesig'],
+                    barline=False
+                )
+                notes_data.append(note)
 
     # Count actual notes (excluding barlines)
     actual_notes = [n for n in notes_data if not n.barline]

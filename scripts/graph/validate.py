@@ -3,18 +3,19 @@ import numpy as np
 from matplotlib.patches import Rectangle
 from matplotlib.collections import LineCollection
 import matplotlib.cm as cm
+from matplotlib.axes import Axes
 from typing import List, Dict, Any, Tuple
 
 from src.constants import XML_ROOT
 from src.extract.analyze import musicxml_to_notes
 from src.test import BACH_CHORALE, BACH_C_MAJOR_PRELUDE
 from src.extract import MusicXMLNote
-from src.graph.make_graph import construct_music_graph
+from src.graph import construct_music_graph, NoteGraph
 from src.utils import get_path
 
 
 def visualize_music_graph(notes: List[MusicXMLNote],
-                          graph_data: Dict[str, Any],
+                          graph_data: NoteGraph,
                           figsize: Tuple[int, int] = (15, 10),
                           show_edges: bool = True,
                           edge_alpha: float = 0.3,
@@ -31,7 +32,7 @@ def visualize_music_graph(notes: List[MusicXMLNote],
         max_edges_to_show: Maximum number of edges to display
     """
     fig, axes = plt.subplots(2, 2, figsize=figsize)
-    fig.suptitle(f'Music Graph Visualization - {graph_data["num_nodes"]} nodes, {graph_data["edge_index"].shape[1]} edges')
+    fig.suptitle(f'Music Graph Visualization - {graph_data.num_nodes} nodes, {graph_data.edge_index.shape[1]} edges')
 
     # 1. Piano roll visualization with graph edges
     ax1 = axes[0, 0]
@@ -57,8 +58,8 @@ def visualize_music_graph(notes: List[MusicXMLNote],
 
 
 def plot_piano_roll_with_edges(notes: List[MusicXMLNote],
-                               graph_data: Dict[str, Any],
-                               ax: plt.Axes,
+                               graph_data: NoteGraph,
+                               ax: Axes,
                                show_edges: bool = True,
                                edge_alpha: float = 0.3,
                                max_edges_to_show: int = 1000) -> None:
@@ -78,9 +79,9 @@ def plot_piano_roll_with_edges(notes: List[MusicXMLNote],
                     ha='center', va='center', fontsize=6)
 
     # Plot edges if requested
-    if show_edges and graph_data['edge_index'].shape[1] > 0:
-        edge_index = graph_data['edge_index']
-        edge_weights = graph_data['edge_attr']
+    if show_edges and graph_data.edge_index.shape[1] > 0:
+        edge_index = graph_data.edge_index
+        edge_weights = graph_data.edge_attr
 
         # Sample edges if too many
         num_edges = edge_index.shape[1]
@@ -126,11 +127,11 @@ def plot_piano_roll_with_edges(notes: List[MusicXMLNote],
                     max(note.pitch for note in notes if not note.barline) + 2)
 
 
-def plot_degree_distribution(graph_data: Dict[str, Any], ax: plt.Axes) -> None:
+def plot_degree_distribution(graph_data: NoteGraph, ax: Axes) -> None:
     """Plot in-degree and out-degree distributions."""
 
-    edge_index = graph_data['edge_index']
-    num_nodes = graph_data['num_nodes']
+    edge_index = graph_data.edge_index
+    num_nodes = graph_data.num_nodes
 
     if edge_index.shape[1] == 0:
         ax.text(0.5, 0.5, 'No edges in graph', ha='center', va='center')
@@ -161,10 +162,10 @@ def plot_degree_distribution(graph_data: Dict[str, Any], ax: plt.Axes) -> None:
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
 
-def plot_edge_weight_distribution(graph_data: Dict[str, Any], ax: plt.Axes) -> None:
+def plot_edge_weight_distribution(graph_data: NoteGraph, ax: Axes) -> None:
     """Plot distribution of edge weights."""
 
-    edge_weights = graph_data['edge_attr']
+    edge_weights = graph_data.edge_attr
 
     if len(edge_weights) == 0:
         ax.text(0.5, 0.5, 'No edges in graph', ha='center', va='center')
@@ -189,12 +190,12 @@ def plot_edge_weight_distribution(graph_data: Dict[str, Any], ax: plt.Axes) -> N
 
 
 def plot_temporal_connectivity(notes: List[MusicXMLNote],
-                               graph_data: Dict[str, Any],
-                               ax: plt.Axes) -> None:
+                               graph_data: NoteGraph,
+                               ax: Axes) -> None:
     """Plot how connectivity changes over time."""
 
-    edge_index = graph_data['edge_index']
-    edge_weights = graph_data['edge_attr']
+    edge_index = graph_data.edge_index
+    edge_weights = graph_data.edge_attr
 
     if edge_index.shape[1] == 0:
         ax.text(0.5, 0.5, 'No edges in graph', ha='center', va='center')
@@ -236,16 +237,16 @@ def plot_temporal_connectivity(notes: List[MusicXMLNote],
     ax2.legend(loc='upper right')
 
 
-def print_validation_stats(notes: List[MusicXMLNote], graph_data: Dict[str, Any]) -> None:
+def print_validation_stats(notes: List[MusicXMLNote], graph_data: NoteGraph) -> None:
     """Print validation statistics to verify graph construction."""
 
     print("\n=== Graph Validation Statistics ===")
-    print(f"Number of nodes: {graph_data['num_nodes']}")
-    print(f"Number of edges: {graph_data['edge_index'].shape[1]}")
+    print(f"Number of nodes: {graph_data.num_nodes}")
+    print(f"Number of edges: {graph_data.edge_index.shape[1]}")
 
-    if graph_data['edge_index'].shape[1] > 0:
-        edge_index = graph_data['edge_index']
-        edge_weights = graph_data['edge_attr']
+    if graph_data.edge_index.shape[1] > 0:
+        edge_index = graph_data.edge_index
+        edge_weights = graph_data.edge_attr
 
         # Check edge directions
         forward_edges = 0
@@ -260,7 +261,7 @@ def print_validation_stats(notes: List[MusicXMLNote], graph_data: Dict[str, Any]
 
         print(f"Forward edges (src.start < tgt.start): {forward_edges}")
         print(f"Same-time edges (src.start == tgt.start): {same_time_edges}")
-        print(f"Edge density: {graph_data['edge_index'].shape[1] / (graph_data['num_nodes'] ** 2):.4f}")
+        print(f"Edge density: {graph_data.edge_index.shape[1] / (graph_data.num_nodes ** 2):.4f}")
 
         # Verify edge weight calculation
         print("\nSample edge verification (first 5 edges):")
@@ -276,7 +277,7 @@ def print_validation_stats(notes: List[MusicXMLNote], graph_data: Dict[str, Any]
 # Example usage
 if __name__ == "__main__":
     path = get_path(XML_ROOT, BACH_C_MAJOR_PRELUDE)
-    test_notes = musicxml_to_notes(path)[:10]
+    test_notes = musicxml_to_notes(path)
 
     # Construct graph
     graph = construct_music_graph(test_notes, max_seconds_apart=1)
