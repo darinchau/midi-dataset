@@ -6,7 +6,7 @@ from src.utils import iterate_subset
 import os
 import shutil
 from tqdm import tqdm
-from src.extract.filter import get_bad_midi_reason
+from src.graph.filter import MIDIFilterCriterion
 
 
 def main():
@@ -16,6 +16,8 @@ def main():
 
     if not os.path.exists(new_path):
         os.makedirs(new_path)
+
+    midi_filter = MIDIFilterCriterion()
 
     copied = 0
     bar = tqdm(iterate_subset(old_path, subset), desc="Copying files")
@@ -28,7 +30,7 @@ def main():
             tqdm.write(f"File already exists, skipping: {new_file_path}")
             continue
 
-        rejection_reason = get_bad_midi_reason(file_path)
+        rejection_reason = midi_filter.get_bad_midi_reason(file_path)
         if rejection_reason:
             tqdm.write(f"Skipping bad MIDI file: {file_path} ({rejection_reason})")
             continue

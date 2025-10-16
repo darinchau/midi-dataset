@@ -129,6 +129,7 @@ def construct_music_graph(
     notes: List[MusicXMLNote],
     remove_barlines: bool = True,
     max_seconds_apart: float = 10.0,
+    time_weight: bool = False
 ) -> NoteGraph:
     """
     Constructs a graph with RAW features. One-hot encoding should be done later.
@@ -136,6 +137,7 @@ def construct_music_graph(
         notes: List of MusicXMLNote objects.
         remove_barlines: Whether to remove barline notes from the graph.
         max_seconds_apart: Maximum time difference to connect notes with edges.
+        time_weight: Whether to weight edges by time difference.
     """
     if not notes:
         return NoteGraph(
@@ -187,7 +189,7 @@ def construct_music_graph(
     valid_diffs = onset_diffs[valid_mask]
 
     # Compute weights
-    edge_weights = np.maximum(1.0 - valid_diffs / max_seconds_apart, 0.0)
+    edge_weights = np.maximum(1.0 - valid_diffs / max_seconds_apart, 0.0) if time_weight else np.ones_like(valid_diffs, dtype=np.float32)
 
     # Final filter for positive weights (should be redundant but just in case)
     positive_mask = edge_weights > 0
@@ -255,7 +257,7 @@ def create_preprocessed_graph(
     )
 
 
-def dict_to_pyg_data(graph: NoteGraph):
+def graph_to_pyg_data(graph: NoteGraph):
     """Convert dictionary format to PyTorch Geometric Data object"""
     node_features = torch.tensor(graph.node_features, dtype=torch.float32)
     edge_index = torch.tensor(graph.edge_index, dtype=torch.long)
