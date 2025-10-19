@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class MusicXMLNote:
-    instrument: int
+    instrument: int  # Program number of the instrument assuming GM (0-127)
     start: float  # seconds from beginning of the piece
     duration: float  # seconds
     start_ql: float  # quarter notes from start of the bar
