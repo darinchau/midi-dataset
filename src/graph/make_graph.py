@@ -9,13 +9,47 @@ from dataclasses import dataclass
 
 
 @dataclass
+class FeatureInfo:
+    """Metadata about graph features."""
+    feature_names: List[str]
+    categorical_features: List[str]
+    continuous_features: List[str]
+    binary_features: List[str]
+
+    @classmethod
+    def empty(cls) -> "FeatureInfo":
+        return cls(
+            feature_names=[],
+            categorical_features=[],
+            continuous_features=[],
+            binary_features=[]
+        )
+
+    def __post_init__(self):
+        # Ensure all feature names are accounted for
+        all_features = set(self.feature_names)
+        accounted_features = set(self.categorical_features) | set(self.continuous_features) | set(self.binary_features)
+        assert all_features == accounted_features, f"Feature names do not match accounted features: {all_features} vs {accounted_features}"
+        assert len(self.feature_names) == len(self.categorical_features) + len(self.continuous_features) + len(self.binary_features), "Feature names mismatch"
+
+
+@dataclass
 class NoteGraph:
     """Data structure for a music note graph."""
     node_features: np.ndarray  # Shape: [num_nodes, num_features]
     edge_index: np.ndarray     # Shape: [2, num_edges]
     edge_attr: np.ndarray      # Shape: [num_edges, num_edge_features]
     num_nodes: int
-    feature_info: Dict[str, Any]  # Metadata about features
+    feature_info: FeatureInfo  # Metadata about features
+
+    def __post_init__(self):
+        assert self.node_features.shape[0] == self.num_nodes, f"Node features do not match num_nodes: {self.node_features.shape[0]} != {self.num_nodes}"
+        assert self.edge_index.shape[1] == self.edge_attr.shape[0], f"Edge index and edge attr size mismatch: {self.edge_index.shape[1]} != {self.edge_attr.shape[0]}"
+        assert self.edge_index.shape[0] == 2, f"Edge index first dimension must be 2, got {self.edge_index.shape[0]}"
+        assert self.node_features.shape[1] == len(self.feature_info.feature_names), f"Node features second dimension does not match feature info: {self.node_features.shape[1]} != {len(self.feature_info.feature_names)}"
+        assert self.node_features.ndim == 2, f"Node features must be 2D, got {self.node_features.shape}"
+        assert self.edge_index.ndim == 2, f"Edge index must be 2D, got {self.edge_index.shape}"
+        assert self.edge_attr.ndim == 2, f"Edge attr must be 2D, got {self.edge_attr.shape}"
 
 
 class MusicGraphPreprocessor:
@@ -47,7 +81,7 @@ class MusicGraphPreprocessor:
     def transform_features(
         self,
         node_features: np.ndarray,
-        feature_info: Dict[str, Any],
+        feature_info: FeatureInfo,
         one_hot_categoricals: bool = True,
         normalize_continuous: bool = True
     ) -> np.ndarray:
@@ -65,10 +99,9 @@ class MusicGraphPreprocessor:
         if not self.is_fitted:
             raise ValueError("Preprocessor must be fitted before transform")
 
-        feature_names = feature_info['feature_names']
         transformed_features = []
 
-        for i, feat_name in enumerate(feature_names):
+        for i, feat_name in enumerate(feature_info.feature_names):
             feat_col = node_features[:, i]
 
             if feat_name == 'instrument' and one_hot_categoricals:
@@ -129,7 +162,6 @@ def construct_music_graph(
     notes: List[MusicXMLNote],
     remove_barlines: bool = True,
     max_seconds_apart: float = 10.0,
-    time_weight: bool = False
 ) -> NoteGraph:
     """
     Constructs a graph with RAW features. One-hot encoding should be done later.
@@ -137,7 +169,6 @@ def construct_music_graph(
         notes: List of MusicXMLNote objects.
         remove_barlines: Whether to remove barline notes from the graph.
         max_seconds_apart: Maximum time difference to connect notes with edges.
-        time_weight: Whether to weight edges by time difference.
     """
     if not notes:
         return NoteGraph(
@@ -145,7 +176,7 @@ def construct_music_graph(
             edge_index=np.array([[], []]),
             edge_attr=np.array([]),
             num_nodes=0,
-            feature_info={}
+            feature_info=FeatureInfo.empty()
         )
 
     # Remove all barlines since we don't care about those for now?
@@ -188,8 +219,8 @@ def construct_music_graph(
     edge_targets = j_indices[valid_mask]
     valid_diffs = onset_diffs[valid_mask]
 
-    # Compute weights
-    edge_weights = np.maximum(1.0 - valid_diffs / max_seconds_apart, 0.0) if time_weight else np.ones_like(valid_diffs, dtype=np.float32)
+    # Compute weights (unused for now: all ones)
+    edge_weights = np.ones_like(valid_diffs, dtype=np.float32)  # Shape: [num_edges]
 
     # Final filter for positive weights (should be redundant but just in case)
     positive_mask = edge_weights > 0
@@ -199,20 +230,18 @@ def construct_music_graph(
 
     # Convert to proper format
     edge_index = np.stack([edge_sources, edge_targets], axis=0).astype(np.int64)
-    edge_attr = edge_weights.astype(np.float32)
+    edge_attr = edge_weights.astype(np.float32)[..., None]
 
     # Store metadata about features
-    feature_info = {
-        'feature_names': [
+    feature_info = FeatureInfo(
+        feature_names=[
             'instrument', 'pitch', 'start', 'duration',
             'start_ql', 'duration_ql', 'index', 'octave',
         ] + (['barline'] if not remove_barlines else []),
-        'categorical_features': ['instrument', 'octave', 'pitch', 'index'],
-        'continuous_features': ['start', 'duration', 'start_ql', 'duration_ql'],
-    }
-    if not remove_barlines:
-        feature_info['feature_names'].append('barline')
-        feature_info['binary_features'] = ['barline']
+        categorical_features=['instrument', 'octave', 'pitch', 'index'],
+        continuous_features=['start', 'duration', 'start_ql', 'duration_ql'],
+        binary_features=['barline'] if not remove_barlines else []
+    )
 
     return NoteGraph(
         node_features=node_features,
