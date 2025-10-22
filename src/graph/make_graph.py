@@ -39,17 +39,23 @@ class NoteGraph:
     node_features: np.ndarray  # Shape: [num_nodes, num_features]
     edge_index: np.ndarray     # Shape: [2, num_edges]
     edge_attr: np.ndarray      # Shape: [num_edges, num_edge_features]
-    num_nodes: int
     feature_info: FeatureInfo  # Metadata about features
 
     def __post_init__(self):
-        assert self.node_features.shape[0] == self.num_nodes, f"Node features do not match num_nodes: {self.node_features.shape[0]} != {self.num_nodes}"
-        assert self.edge_index.shape[1] == self.edge_attr.shape[0], f"Edge index and edge attr size mismatch: {self.edge_index.shape[1]} != {self.edge_attr.shape[0]}"
+        assert self.num_edges == self.edge_attr.shape[0], f"Edge index and edge attr size mismatch: {self.edge_index.shape[1]} != {self.edge_attr.shape[0]}"
         assert self.edge_index.shape[0] == 2, f"Edge index first dimension must be 2, got {self.edge_index.shape[0]}"
         assert self.node_features.shape[1] == len(self.feature_info.feature_names), f"Node features second dimension does not match feature info: {self.node_features.shape[1]} != {len(self.feature_info.feature_names)}"
         assert self.node_features.ndim == 2, f"Node features must be 2D, got {self.node_features.shape}"
         assert self.edge_index.ndim == 2, f"Edge index must be 2D, got {self.edge_index.shape}"
         assert self.edge_attr.ndim == 2, f"Edge attr must be 2D, got {self.edge_attr.shape}"
+
+    @property
+    def num_nodes(self) -> int:
+        return self.node_features.shape[0]
+
+    @property
+    def num_edges(self) -> int:
+        return self.edge_index.shape[1]
 
 
 class MusicGraphPreprocessor:
@@ -130,11 +136,6 @@ class MusicGraphPreprocessor:
                     normalized = feat_col / 127.0
                     transformed_features.append(normalized.reshape(-1, 1))
 
-            elif feat_name in ['velocity']:
-                # Normalize to [0, 1]
-                normalized = feat_col / 127.0
-                transformed_features.append(normalized.reshape(-1, 1))
-
             elif feat_name in ['start', 'duration', 'start_ql', 'duration_ql']:
                 if normalize_continuous:
                     # Apply log transformation for duration-like features
@@ -175,7 +176,6 @@ def construct_music_graph(
             node_features=np.array([]),
             edge_index=np.array([[], []]),
             edge_attr=np.array([]),
-            num_nodes=0,
             feature_info=FeatureInfo.empty()
         )
 
@@ -247,7 +247,6 @@ def construct_music_graph(
         node_features=node_features,
         edge_index=edge_index,
         edge_attr=edge_attr,
-        num_nodes=num_nodes,
         feature_info=feature_info
     )
 
@@ -281,7 +280,6 @@ def create_preprocessed_graph(
         node_features=processed_features,
         edge_index=graph.edge_index,
         edge_attr=graph.edge_attr,
-        num_nodes=graph.num_nodes,
         feature_info=graph.feature_info
     )
 
@@ -296,7 +294,220 @@ def graph_to_pyg_data(graph: NoteGraph):
         x=node_features,
         edge_index=edge_index,
         edge_attr=edge_attr,
-        num_nodes=graph.num_nodes
     )
 
     return data
+
+
+def pyg_data_to_graph(data: Data, feature_info: FeatureInfo) -> NoteGraph:
+    """Convert PyTorch Geometric Data object back to NoteGraph format."""
+    # Convert tensors back to numpy arrays
+    node_features = data.x.cpu().numpy() if data.x is not None else np.array([])
+    edge_index = data.edge_index.cpu().numpy() if data.edge_index is not None else np.array([[], []])
+    edge_attr = data.edge_attr.cpu().numpy() if data.edge_attr is not None else np.array([])
+
+    return NoteGraph(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        feature_info=feature_info
+    )
+
+
+def graph_to_xml_notes(
+    graph: NoteGraph,
+    preprocessor: Optional[MusicGraphPreprocessor] = None,
+    default_velocity: int = 64,
+    default_timesig: Optional[str] = None,
+    preprocessed: bool = False
+) -> List[MusicXMLNote]:
+    """
+    Convert NoteGraph back to list of MusicXMLNote objects.
+
+    Args:
+        graph: NoteGraph object to convert
+        preprocessor: If features were preprocessed, provide the preprocessor to reverse transformations
+        default_velocity: Default MIDI velocity for notes (not stored in graph)
+        default_timesig: Default time signature (not stored in graph)
+        preprocessed: Whether the graph features are preprocessed (one-hot encoded, normalized)
+
+    Returns:
+        List of MusicXMLNote objects
+    """
+    if graph.num_nodes == 0:
+        return []
+
+    # First, we need to reverse any preprocessing if applicable
+    if preprocessed and preprocessor is not None:
+        features = reverse_preprocessing(graph.node_features, graph.feature_info, preprocessor)
+    else:
+        features = graph.node_features
+
+    # Extract features based on feature_info
+    feature_indices = {name: i for i, name in enumerate(graph.feature_info.feature_names)}
+
+    notes: list[MusicXMLNote] = []
+    for i in range(graph.num_nodes):
+        if 'instrument' not in feature_indices:
+            raise ValueError("Feature 'instrument' missing from graph features")
+        instrument = int(features[i, feature_indices['instrument']])
+
+        if 'start' not in feature_indices:
+            raise ValueError("Feature 'start' missing from graph features")
+        start = float(features[i, feature_indices['start']])
+
+        if 'duration' not in feature_indices:
+            raise ValueError("Feature 'duration' missing from graph features")
+        duration = float(features[i, feature_indices['duration']])
+
+        if 'start_ql' not in feature_indices:
+            raise ValueError("Feature 'start_ql' missing from graph features")
+        start_ql = float(features[i, feature_indices['start_ql']])
+
+        if 'duration_ql' not in feature_indices:
+            raise ValueError("Feature 'duration_ql' missing from graph features")
+        duration_ql = float(features[i, feature_indices['duration_ql']])
+
+        if 'index' not in feature_indices:
+            raise ValueError("Feature 'index' missing from graph features")
+        index = int(features[i, feature_indices['index']])
+
+        if 'octave' not in feature_indices:
+            raise ValueError("Feature 'octave' missing from graph features")
+        octave = int(features[i, feature_indices['octave']])
+
+        if 'barline' in feature_indices:
+            barline = bool(features[i, feature_indices['barline']] > 0.5)
+        else:
+            barline = False
+
+        velocity = default_velocity
+        timesig = default_timesig
+
+        note = MusicXMLNote(
+            instrument=instrument,
+            start=start,
+            duration=duration,
+            start_ql=start_ql,
+            duration_ql=duration_ql,
+            index=index,
+            octave=octave,
+            barline=barline,
+            velocity=velocity,
+            timesig=timesig
+        )
+
+        notes.append(note)
+
+    notes.sort(key=lambda x: (x.start, x.pitch))
+    return notes
+
+
+def reverse_preprocessing(
+    processed_features: np.ndarray,
+    feature_info: FeatureInfo,
+    preprocessor: MusicGraphPreprocessor
+) -> np.ndarray:
+    """
+    Reverse the preprocessing transformations to get back raw features.
+
+    This function handles:
+    - Reversing one-hot encoding
+    - Denormalizing continuous features
+    """
+    if not preprocessor.is_fitted:
+        raise ValueError("Preprocessor must be fitted to reverse transformations")
+
+    raw_features = []
+    current_idx = 0
+
+    # Create reverse mappings
+    reverse_instrument = {v: k for k, v in preprocessor.instrument_mapping.items()}
+    reverse_octave = {v: k for k, v in preprocessor.octave_mapping.items()}
+    reverse_pitch = {v: k for k, v in preprocessor.pitch_mapping.items()}
+
+    for feat_name in feature_info.feature_names:
+        if feat_name == 'instrument':
+            # Reverse one-hot encoding
+            num_instruments = len(preprocessor.instrument_mapping)
+            one_hot = processed_features[:, current_idx:current_idx + num_instruments]
+            raw_values = []
+            for row in one_hot:
+                idx = np.argmax(row).item()
+                raw_values.append(reverse_instrument.get(idx, 0))
+            raw_features.append(np.array(raw_values))
+            current_idx += num_instruments
+
+        elif feat_name == 'octave':
+            # Reverse one-hot encoding
+            num_octaves = len(preprocessor.octave_mapping)
+            one_hot = processed_features[:, current_idx:current_idx + num_octaves]
+            raw_values = []
+            for row in one_hot:
+                idx = np.argmax(row).item()
+                raw_values.append(reverse_octave.get(idx, 0))
+            raw_features.append(np.array(raw_values))
+            current_idx += num_octaves
+
+        elif feat_name == 'pitch':
+            # Assuming one-hot encoding with 128 MIDI values
+            one_hot = processed_features[:, current_idx:current_idx + 128]
+            raw_values = []
+            for row in one_hot:
+                idx = np.argmax(row)
+                raw_values.append(idx)
+            raw_features.append(np.array(raw_values))
+            current_idx += 128
+
+        elif feat_name == 'velocity':
+            # Denormalize from [0, 1] to [0, 127]
+            normalized = processed_features[:, current_idx]
+            raw_values = normalized * 127.0
+            raw_features.append(raw_values)
+            current_idx += 1
+
+        elif feat_name in ['start', 'duration', 'start_ql', 'duration_ql']:
+            # For now, just keep as is - proper denormalization would require
+            # storing mean/std from original data
+            raw_features.append(processed_features[:, current_idx])
+            current_idx += 1
+
+        elif feat_name == 'index':
+            # Keep as is
+            raw_features.append(processed_features[:, current_idx])
+            current_idx += 1
+
+        elif feat_name == 'barline':
+            # Binary feature
+            raw_features.append(processed_features[:, current_idx])
+            current_idx += 1
+
+        else:
+            # Unknown feature, keep as is
+            raw_features.append(processed_features[:, current_idx])
+            current_idx += 1
+
+    return np.column_stack(raw_features)
+
+
+# Example usage:
+def convert_pyg_to_xml(
+    data: Data,
+    feature_info: FeatureInfo,
+    preprocessor: Optional[MusicGraphPreprocessor] = None,
+    preprocessed: bool = False
+) -> List[MusicXMLNote]:
+    """
+    Convenience function to convert PyTorch Geometric Data directly to XML notes.
+
+    Args:
+        data: PyTorch Geometric Data object
+        feature_info: Metadata about features in the graph
+        preprocessor: Preprocessor used for transforming features (if applicable)
+        preprocessed: Whether the features in data are preprocessed
+
+    Returns:
+        List of MusicXMLNote objects
+    """
+    graph = pyg_data_to_graph(data, feature_info)
+    return graph_to_xml_notes(graph, preprocessor, preprocessed=preprocessed)

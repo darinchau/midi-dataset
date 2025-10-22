@@ -36,7 +36,7 @@ def visualize_music_graph(notes: List[MusicXMLNote],
 
     # 1. Piano roll visualization with graph edges
     ax1 = axes[0, 0]
-    plot_piano_roll_with_edges(notes, graph_data, ax1, show_edges, edge_alpha, max_edges_to_show)
+    plot_piano_roll_with_edges(graph_data, ax1, show_edges, edge_alpha, max_edges_to_show)
 
     # 2. Node degree distribution
     ax2 = axes[0, 1]
@@ -48,60 +48,69 @@ def visualize_music_graph(notes: List[MusicXMLNote],
 
     # 4. Temporal connectivity pattern
     ax4 = axes[1, 1]
-    plot_temporal_connectivity(notes, graph_data, ax4)
+    plot_temporal_connectivity(graph_data, ax4)
 
     plt.tight_layout()
     plt.show()
 
     # Print validation statistics
-    print_validation_stats(notes, graph_data)
+    print_validation_stats(graph_data)
 
 
-def plot_piano_roll_with_edges(notes: List[MusicXMLNote],
-                               graph_data: NoteGraph,
-                               ax: Axes,
-                               show_edges: bool = True,
-                               edge_alpha: float = 0.3,
-                               max_edges_to_show: int = 1000) -> None:
+def plot_piano_roll_with_edges(
+    graph_data: NoteGraph,
+    ax: Axes,
+    show_edges: bool = True,
+    edge_alpha: float = 0.3,
+    max_edges_to_show: int = 1000
+) -> None:
     """Plot piano roll visualization with edges."""
 
+    start_idx = graph_data.feature_info.feature_names.index('start')
+    duration_idx = graph_data.feature_info.feature_names.index('duration')
+    pitch_idx = graph_data.feature_info.feature_names.index('pitch')
+    num_nodes = graph_data.num_nodes
+    node_features = graph_data.node_features
+
     # Plot notes as rectangles
-    for i, note in enumerate(notes):
-        if not note.barline:
-            rect = Rectangle((note.start, note.pitch - 0.4),
-                             note.duration, 0.8,
-                             facecolor='skyblue',
-                             edgecolor='darkblue',
-                             linewidth=1)
-            ax.add_patch(rect)
-            # Add note index
-            ax.text(note.start + note.duration/2, note.pitch, str(i),
-                    ha='center', va='center', fontsize=6)
+    for i in range(num_nodes):
+        rect = Rectangle(
+            (node_features[i, start_idx], node_features[i, pitch_idx] - 0.4),
+            node_features[i, duration_idx], 0.8,
+            facecolor='skyblue',
+            edgecolor='darkblue',
+            linewidth=1
+        )
+        ax.add_patch(rect)
+        ax.text(
+            node_features[i, start_idx] + node_features[i, duration_idx]/2, node_features[i, pitch_idx],
+            str(i),
+            ha='center',
+            va='center',
+            fontsize=6
+        )
 
     # Plot edges if requested
     if show_edges and graph_data.edge_index.shape[1] > 0:
         edge_index = graph_data.edge_index
         edge_weights = graph_data.edge_attr
 
-        # Sample edges if too many
         num_edges = edge_index.shape[1]
         if num_edges > max_edges_to_show:
             indices = np.random.choice(num_edges, max_edges_to_show, replace=False)
             edge_index = edge_index[:, indices]
             edge_weights = edge_weights[indices]
 
-        # Create line segments for edges
         segments = []
         colors = []
 
         for idx in range(edge_index.shape[1]):
             src, tgt = edge_index[0, idx], edge_index[1, idx]
-            src_note = notes[src]
-            tgt_note = notes[tgt]
 
-            # Draw edge from end of source to start of target
-            x1, y1 = src_note.start + src_note.duration/2, src_note.pitch
-            x2, y2 = tgt_note.start + tgt_note.duration/2, tgt_note.pitch
+            x1 = node_features[src, start_idx] + node_features[src, duration_idx]/2
+            y1 = node_features[src, pitch_idx]
+            x2 = node_features[tgt, start_idx] + node_features[tgt, duration_idx]/2
+            y2 = node_features[tgt, pitch_idx]
 
             segments.append([(x1, y1), (x2, y2)])
             colors.append(edge_weights[idx])
@@ -120,11 +129,12 @@ def plot_piano_roll_with_edges(notes: List[MusicXMLNote],
     ax.set_title('Piano Roll with Graph Edges')
     ax.grid(True, alpha=0.3)
 
+    offsets = node_features[:, start_idx] + node_features[:, duration_idx]
+
     # Set reasonable limits
-    if notes:
-        ax.set_xlim(-0.5, max(note.start + note.duration for note in notes) + 0.5)
-        ax.set_ylim(min(note.pitch for note in notes if not note.barline) - 2,
-                    max(note.pitch for note in notes if not note.barline) + 2)
+    ax.set_xlim(-0.5, max(offsets) + 0.5)
+    ax.set_ylim(node_features[:, pitch_idx].min() - 2,
+                node_features[:, pitch_idx].max() + 2)
 
 
 def plot_degree_distribution(graph_data: NoteGraph, ax: Axes) -> None:
@@ -189,8 +199,7 @@ def plot_edge_weight_distribution(graph_data: NoteGraph, ax: Axes) -> None:
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
 
-def plot_temporal_connectivity(notes: List[MusicXMLNote],
-                               graph_data: NoteGraph,
+def plot_temporal_connectivity(graph_data: NoteGraph,
                                ax: Axes) -> None:
     """Plot how connectivity changes over time."""
 
@@ -202,14 +211,16 @@ def plot_temporal_connectivity(notes: List[MusicXMLNote],
         ax.set_title('Temporal Connectivity')
         return
 
+    note_starts = graph_data.node_features[:, graph_data.feature_info.feature_names.index('start')]
+
     # Group edges by source note time
-    time_bins = np.linspace(0, max(note.start for note in notes), 50)
+    time_bins = np.linspace(0, note_starts.max(), 50)
     connectivity = np.zeros(len(time_bins) - 1)
     weights_sum = np.zeros(len(time_bins) - 1)
 
     for idx in range(edge_index.shape[1]):
         src = edge_index[0, idx]
-        src_time = notes[src].start
+        src_time = note_starts[src]
         bin_idx = np.searchsorted(time_bins, src_time) - 1
         if 0 <= bin_idx < len(connectivity):
             connectivity[bin_idx] += 1
@@ -237,12 +248,14 @@ def plot_temporal_connectivity(notes: List[MusicXMLNote],
     ax2.legend(loc='upper right')
 
 
-def print_validation_stats(notes: List[MusicXMLNote], graph_data: NoteGraph) -> None:
+def print_validation_stats(graph_data: NoteGraph) -> None:
     """Print validation statistics to verify graph construction."""
 
     print("\n=== Graph Validation Statistics ===")
     print(f"Number of nodes: {graph_data.num_nodes}")
     print(f"Number of edges: {graph_data.edge_index.shape[1]}")
+
+    note_starts = graph_data.node_features[:, graph_data.feature_info.feature_names.index('start')]
 
     if graph_data.edge_index.shape[1] > 0:
         edge_index = graph_data.edge_index
@@ -254,9 +267,9 @@ def print_validation_stats(notes: List[MusicXMLNote], graph_data: NoteGraph) -> 
 
         for idx in range(edge_index.shape[1]):
             src, tgt = edge_index[0, idx], edge_index[1, idx]
-            if notes[src].start < notes[tgt].start:
+            if note_starts[src] < note_starts[tgt]:
                 forward_edges += 1
-            elif notes[src].start == notes[tgt].start:
+            elif note_starts[src] == note_starts[tgt]:
                 same_time_edges += 1
 
         print(f"Forward edges (src.start < tgt.start): {forward_edges}")
@@ -267,7 +280,7 @@ def print_validation_stats(notes: List[MusicXMLNote], graph_data: NoteGraph) -> 
         print("\nSample edge verification (first 5 edges):")
         for idx in range(min(5, edge_index.shape[1])):
             src, tgt = edge_index[0, idx], edge_index[1, idx]
-            time_diff = notes[tgt].start - notes[src].start
+            time_diff = note_starts[tgt] - note_starts[src]
             expected_weight = max(1.0 - time_diff / 1, 0.0)
             actual_weight = edge_weights[idx]
             print(f"  Edge {src}->{tgt}: time_diff={time_diff:.3f}, "
