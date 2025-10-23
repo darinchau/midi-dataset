@@ -4,24 +4,27 @@ from typing import List, Optional
 from functools import cache
 import numpy as np
 
-from ..extract.utils import get_time_signature_map
+from ..extract.utils import get_ql_idx_map, get_time_signature_map
 from ..extract import musicxml_to_notes, MusicXMLNote
 from .make_graph import NoteGraph
 
 
 class MIDIFilterCriterion:
+    @staticmethod
     @cache
-    def permitted_index(self) -> List[int]:
+    def permitted_index() -> List[int]:
         """Returns the acceptable range of note indices."""
         return list(range(-15, 20))
 
+    @staticmethod
     @cache
-    def permitted_pitch(self) -> List[int]:
+    def permitted_pitch() -> List[int]:
         """Returns the acceptable range of note pitches."""
         return list(range(21, 109))
 
+    @staticmethod
     @cache
-    def permitted_instruments(self) -> List[int]:
+    def permitted_instruments() -> List[int]:
         """Returns the acceptable range of note instruments."""
         # Use a subset of the more common General MIDI instruments
         # 0: Acoustic Grand Piano
@@ -34,25 +37,33 @@ class MIDIFilterCriterion:
         # 43: Contrabass
         return [0, 1, 2, 6, 40, 41, 42, 43]
 
+    @staticmethod
     @cache
-    def permitted_octaves(self) -> List[int]:
+    def permitted_octaves() -> List[int]:
         """Returns the acceptable range of note octaves."""
         # Calculated automatically from permitted pitches and permitted index
         # from the relation:
         # pitch = 12 * octave + ([0, 7, 2, 9, 4, 11, 5][index % 7] + (index + 1) // 7
-        min_pitch = min(self.permitted_pitch())
-        max_pitch = max(self.permitted_pitch())
-        min_index = min(self.permitted_index())
-        max_index = max(self.permitted_index())
+        min_pitch = min(MIDIFilterCriterion.permitted_pitch())
+        max_pitch = max(MIDIFilterCriterion.permitted_pitch())
+        min_index = min(MIDIFilterCriterion.permitted_index())
+        max_index = max(MIDIFilterCriterion.permitted_index())
         min_octave = (min_pitch - (min_index + 1) // 7 - 11) // 12
         max_octave = (max_pitch - (max_index + 1) // 7) // 12
         return list(range(min_octave, max_octave + 1))
 
+    @staticmethod
     @cache
-    def permitted_timesigs(self) -> List[int]:
+    def permitted_timesigs() -> List[int]:
         """Returns the acceptable time signatures in their index form as defined in utils."""
         ls = get_time_signature_map().keys()
         return [i for i in ls if get_time_signature_map()[i] is not None]
+
+    @staticmethod
+    @cache
+    def permitted_timesig_qls() -> List[float]:
+        """Returns the acceptable time signatures in quarter length form."""
+        return [ts for ts in get_ql_idx_map().values() if ts is not None]
 
     def get_bad_midi_reason(self, file_path: str | list[MusicXMLNote]) -> str:
         """Returns an empty string if the MIDI file is good, otherwise a reason for rejection."""

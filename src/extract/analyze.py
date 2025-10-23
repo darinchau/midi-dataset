@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 import logging
 from dataclasses import dataclass
 from typing import List
+from functools import lru_cache
 from .utils import get_text_or_raise, get_inv_gm_instruments_map, dynamics_to_velocity, get_time_signature_map
 from ..utils import get_gm_instruments_map
 
@@ -43,6 +44,7 @@ class MusicXMLNote:
             if not self.duration == 0.0 and self.duration_ql == 0.0:
                 raise ValueError("Barline note should have zero duration and quarter length")
             return  # No further validation needed for barlines
+
         if not (0 <= self.instrument < 128):
             raise ValueError(f"Invalid instrument: {self.instrument}")
         if not (0 <= self.pitch < 128):
@@ -51,13 +53,21 @@ class MusicXMLNote:
             raise ValueError("Start and duration must be non-negative")
         if not (0 <= self.velocity <= 127):
             raise ValueError(f"Invalid velocity: {self.velocity}")
+        # Check time signature validity
+        if self.timesig is not None:
+            num, denom = self.timesig.split('/')
+            if not (num.isdigit() and denom.isdigit() and int(denom) in {1, 2, 4, 8, 16, 32, 64}):
+                raise ValueError(f"Invalid time signature: {self.timesig}")
+            max_start_ql = (int(num) * 4) / int(denom)
+            if not (0 <= self.start_ql < max_start_ql):
+                raise ValueError(f"start_ql {self.start_ql} out of range for time signature {self.timesig}")
 
     @property
     def pitch(self):
         """Return the MIDI pitch number. A0 is 21 and C8 is 108. Barlines are 0."""
         if self.barline:
             return -1
-        return 12 * (self.octave + 1) + ([0, 7, 2, 9, 4, 11, 5][self.index % 7] + (self.index + 1) // 7)
+        return index_octave_to_pitch(self.index, self.octave)
 
     @property
     def name(self):
@@ -85,6 +95,11 @@ class MusicXMLNote:
         """Convert MIDI pitch number to octave number."""
         assert 0 <= pitch < 128, f"Invalid pitch: {pitch}"
         return (pitch // 12) - 1
+
+
+@lru_cache(maxsize=None)
+def index_octave_to_pitch(index: int, octave: int) -> int:
+    return 12 * (octave + 1) + ([0, 7, 2, 9, 4, 11, 5][index % 7] + (index + 1) // 7)
 
 
 def _step_alter_to_lof_index(step: str, alter: int) -> int:
@@ -182,6 +197,11 @@ def parse_musicxml(xml_path: str):
 
             for element in measure:
                 if element.tag == 'note':
+                    # Skip grace notes (for now?)
+                    is_grace = element.find('grace') is not None
+                    if is_grace:
+                        continue
+
                     pitch_elem = element.find('pitch')
                     if pitch_elem is not None:
                         # Get pitch components

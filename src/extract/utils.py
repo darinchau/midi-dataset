@@ -31,6 +31,29 @@ def get_inv_time_signature_map():
 
 
 @cache
+def get_ql_idx_map() -> dict[int, float | None]:
+    new_mapping: dict[int, float | None] = {}
+    ql_ts_map = get_ql_timesig_map()
+    for k, v in get_time_signature_map().items():
+        if v is not None:
+            new_mapping[k] = ql_ts_map[v]
+        else:
+            new_mapping[k] = None
+    return new_mapping
+
+
+@cache
+def get_ql_timesig_map() -> dict[str, float]:
+    mapping: dict[str, float] = {}
+    for k, v in get_time_signature_map().items():
+        if v is not None:
+            numerator, denominator = v.split('/')
+            ql = 4 * int(numerator) / int(denominator)
+            mapping[v] = ql
+    return mapping
+
+
+@cache
 def get_inv_gm_instruments_map():
     return {v: k for k, v in get_gm_instruments_map().items()}
 

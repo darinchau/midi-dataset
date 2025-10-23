@@ -46,38 +46,6 @@ def sample_from_logprobs(log_probs_dict: dict[int, float]) -> int:
     return list(log_probs_dict.keys())[-1]
 
 
-def subgraph_from_indices(graph: NoteGraph, selected_nodes: list[int]) -> NoteGraph:
-    selected_nodes_set = set(selected_nodes)
-
-    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_nodes)}
-
-    sub_node_features = graph.node_features[selected_nodes]
-
-    sub_edges = []
-    sub_edge_attrs = []
-
-    for i in range(graph.edge_index.shape[1]):
-        src, dst = graph.edge_index[0, i], graph.edge_index[1, i]
-        if src in selected_nodes_set and dst in selected_nodes_set:
-            # Add edge with remapped indices
-            sub_edges.append([old_to_new[src], old_to_new[dst]])
-            sub_edge_attrs.append(graph.edge_attr[i])
-
-    if sub_edges:
-        sub_edge_index = np.array(sub_edges, dtype=np.int64).T
-        sub_edge_attr = np.array(sub_edge_attrs, dtype=graph.edge_attr.dtype)
-    else:
-        sub_edge_index = np.zeros((2, 0), dtype=np.int64)
-        sub_edge_attr = np.zeros((0, graph.edge_attr.shape[1]), dtype=graph.edge_attr.dtype)
-
-    return NoteGraph(
-        node_features=sub_node_features,
-        edge_index=sub_edge_index,
-        edge_attr=sub_edge_attr,
-        feature_info=graph.feature_info
-    )
-
-
 def find_path_inner(
     graph: NoteGraph,
     adj_list: dict[int, list[int]],
@@ -105,23 +73,27 @@ def find_path_inner(
 
 
 def extract_subgraph(
-    graph: NoteGraph,
+    notes: list[MusicXMLNote],
     n: int,
+    max_seconds_apart: float = 1,
     time_weight_beta: float = 1,
     pitch_weight_beta: float = 1,
-) -> NoteGraph:
+) -> list[int]:
     """
     Extracts a connected subgraph of size n from the given graph.
     Returns the list of selected node indices and the corresponding subgraph.
 
     Args:
-        graph (NoteGraph): The original music graph.
+        notes (list[MusicXMLNote]): The original music notes.
         n (int): The number of nodes in the desired subgraph.
         time_weight_beta (float): Weighting factor for time difference in edge weights. The higher the beta, the more likely you get note groups with small time differences.
         pitch_weight_beta (float): Weighting factor for pitch difference in edge weights. The higher the beta, the more likely you get note groups with small pitch differences.
+
     Returns:
-        NoteGraph: The extracted subgraph.
+        list[int]: The list of selected node indices forming the subgraph.
     """
+    graph = construct_music_graph(notes, max_seconds_apart=max_seconds_apart)
+
     if n > graph.num_nodes:
         raise ValueError(f"Requested subgraph size {n} is larger than total nodes {graph.num_nodes}")
 
@@ -143,19 +115,21 @@ def extract_subgraph(
         current_path = [start_node]
         result = find_path_inner(graph, adj_list, current_path, n, time_weight_beta, pitch_weight_beta)
         if result is not None:
-            return subgraph_from_indices(graph, result)
+            return result
     raise ValueError(f"Could not find a subgraph of size {n} after trying all possible starting nodes.")
 
 
-if __name__ == "__main__":
+def test():
     from scripts.graph.validate import visualize_music_graph
     path = get_path(XML_ROOT, BACH_C_MAJOR_PRELUDE)
     notes = musicxml_to_notes(path)
     is_good_midi(path)
 
-    graph = construct_music_graph(notes, max_seconds_apart=1)
-    subgraph = extract_subgraph(graph, 10)
+    sampled_notes = extract_subgraph(notes, 10, max_seconds_apart=1)
 
-    g = graph_to_pyg_data(subgraph)
-
+    subgraph = construct_music_graph([n for i, n in enumerate(notes) if i in sampled_notes])
     visualize_music_graph(subgraph)
+
+
+if __name__ == "__main__":
+    test()
