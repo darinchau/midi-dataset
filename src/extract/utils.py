@@ -4,7 +4,7 @@ from ..utils import get_gm_instruments_map
 
 
 @cache
-def get_time_signature_map():
+def get_time_signature_map() -> dict[int, str | None]:
     return {
         0: None,
         1: "4/4",

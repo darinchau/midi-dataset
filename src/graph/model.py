@@ -9,7 +9,8 @@ import numpy as np
 from torch import Tensor
 from typing import Optional, Tuple, Dict, List
 
-from src.graph.filter import MIDIFilterCriterion
+from ..extract.utils import get_time_signature_map
+from .filter import MIDIFilterCriterion
 
 
 class AttentionalReadout(nn.Module):
@@ -53,10 +54,12 @@ class SymMusicMotifGNN(nn.Module):
         num_octaves: int = 12,
         num_pitches: int = 128,
         num_indices: int = 16,
+        num_timesigs: int = 15,
         instrument_emb_dim: int = 8,
         octave_emb_dim: int = 4,
         pitch_emb_dim: int = 16,
         index_emb_dim: int = 8,
+        timesig_emb_dim: int = 4,
         time_emb_dim: int = 64,
         edge_attr_dim: int = 1,
         edge_emb_dim: int = 32,
@@ -70,6 +73,7 @@ class SymMusicMotifGNN(nn.Module):
         self.octave_embedding = nn.Embedding(num_octaves, octave_emb_dim)
         self.pitch_embedding = nn.Embedding(num_pitches, pitch_emb_dim)
         self.index_embedding = nn.Embedding(num_indices, index_emb_dim)
+        self.timesig_embedding = nn.Embedding(num_timesigs, timesig_emb_dim)
 
         # MLP for continuous features
         self.continuous_encoder = nn.Sequential(
@@ -81,7 +85,7 @@ class SymMusicMotifGNN(nn.Module):
         # Calculate total embedding dimension
         self.embedded_feature_dim = (
             instrument_emb_dim + octave_emb_dim + pitch_emb_dim +
-            index_emb_dim + time_emb_dim
+            index_emb_dim + timesig_emb_dim + time_emb_dim
         )
 
         # Initial feature transformation
@@ -147,15 +151,17 @@ class SymMusicMotifGNN(nn.Module):
         timeinfo = x[:, 2:6].float()
         index = x[:, 6].long()
         octave = x[:, 7].long()
+        timesig = x[:, 8].long()
 
         instrument_emb = self.instrument_embedding(instrument)
         pitch_emb = self.pitch_embedding(pitch)
         index_emb = self.index_embedding(index)
         octave_emb = self.octave_embedding(octave)
+        timesig_emb = self.timesig_embedding(timesig)
         time_emb = self.continuous_encoder(timeinfo)
 
         x = torch.cat([
-            instrument_emb, pitch_emb, index_emb, octave_emb, time_emb
+            instrument_emb, pitch_emb, index_emb, octave_emb, timesig_emb, time_emb
         ], dim=1)
 
         x = self.feature_transform(x)
@@ -218,11 +224,13 @@ if __name__ == "__main__":
     permitted_octaves = normalizer.permitted_octaves()
     permitted_pitch = normalizer.permitted_pitch()
     permitted_index = normalizer.permitted_index()
+    permitted_timesigs = [get_time_signature_map()[i] for i in sorted(normalizer.permitted_timesigs())]
 
     print("Permitted instruments:", permitted_instruments)
     print("Permitted octaves:", permitted_octaves)
     print("Permitted pitch:", permitted_pitch)
     print("Permitted index:", permitted_index)
+    print("Permitted time signatures:", permitted_timesigs)
 
     # Initialize the model
     model = SymMusicMotifGNN(
@@ -232,11 +240,13 @@ if __name__ == "__main__":
         num_octaves=len(permitted_octaves),
         num_pitches=len(permitted_pitch),
         num_indices=len(permitted_index),
+        num_timesigs=len(permitted_timesigs),
         instrument_emb_dim=8,
         octave_emb_dim=4,
         pitch_emb_dim=16,
         index_emb_dim=8,
         time_emb_dim=64,
+        timesig_emb_dim=4,
     )
 
     print(sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters")

@@ -2,6 +2,9 @@
 # Stores the filter function we use to get clean XMLs in the current phase of training
 from typing import List, Optional
 from functools import cache
+import numpy as np
+
+from ..extract.utils import get_time_signature_map
 from ..extract import musicxml_to_notes, MusicXMLNote
 from .make_graph import NoteGraph
 
@@ -45,6 +48,12 @@ class MIDIFilterCriterion:
         max_octave = (max_pitch - (max_index + 1) // 7) // 12
         return list(range(min_octave, max_octave + 1))
 
+    @cache
+    def permitted_timesigs(self) -> List[int]:
+        """Returns the acceptable time signatures in their index form as defined in utils."""
+        ls = get_time_signature_map().keys()
+        return [i for i in ls if get_time_signature_map()[i] is not None]
+
     def get_bad_midi_reason(self, file_path: str | list[MusicXMLNote]) -> str:
         """Returns an empty string if the MIDI file is good, otherwise a reason for rejection."""
         if isinstance(file_path, str):
@@ -60,6 +69,10 @@ class MIDIFilterCriterion:
 
         if any(note.timesig is None for note in notes):
             return "MissingTimeSignature"
+
+        permitted_timesig_values = {get_time_signature_map()[i] for i in self.permitted_timesigs()}
+        if any(note.timesig not in permitted_timesig_values for note in notes):
+            return "InvalidTimeSignature"
 
         index_range = self.permitted_index()
         if any(note.index not in index_range for note in notes):
@@ -82,32 +95,33 @@ class MIDIFilterCriterion:
 
     def normalize(self, graph: NoteGraph) -> NoteGraph:
         """Normalizes the note indices, instruments, and pitches to start from 0."""
-        import torch
-
         # Create mapping dictionaries for each categorical feature
         index_map = {index: i for i, index in enumerate(sorted(self.permitted_index()))}
         instrument_map = {inst: i for i, inst in enumerate(sorted(self.permitted_instruments()))}
         pitch_map = {pitch: i for i, pitch in enumerate(sorted(self.permitted_pitch()))}
+        timesig_map = {ts: i for i, ts in enumerate(sorted(self.permitted_timesigs()))}
 
         # Get column indices for each feature
-        index_emb = graph.feature_info["feature_names"].index("index")
-        instrument_emb = graph.feature_info["feature_names"].index("instrument")
-        pitch_emb = graph.feature_info["feature_names"].index("pitch")
+        index_emb = graph.feature_info.feature_names.index("index")
+        instrument_emb = graph.feature_info.feature_names.index("instrument")
+        pitch_emb = graph.feature_info.feature_names.index("pitch")
+        timesig_emb = graph.feature_info.feature_names.index("timesig")
 
         # Apply normalization via mappings
-        graph.node_features[:, index_emb] = torch.tensor(
+        graph.node_features[:, index_emb] = np.array(
             [index_map[int(v.item())] for v in graph.node_features[:, index_emb]],
-            dtype=torch.long
         )
 
-        graph.node_features[:, instrument_emb] = torch.tensor(
+        graph.node_features[:, instrument_emb] = np.array(
             [instrument_map[int(v.item())] for v in graph.node_features[:, instrument_emb]],
-            dtype=torch.long
         )
 
-        graph.node_features[:, pitch_emb] = torch.tensor(
+        graph.node_features[:, pitch_emb] = np.array(
             [pitch_map[int(v.item())] for v in graph.node_features[:, pitch_emb]],
-            dtype=torch.long
+        )
+
+        graph.node_features[:, timesig_emb] = np.array(
+            [timesig_map[int(v.item())] for v in graph.node_features[:, timesig_emb]],
         )
 
         return graph
