@@ -57,6 +57,11 @@ class NoteGraph:
     def num_edges(self) -> int:
         return self.edge_index.shape[1]
 
+    def show_stats(self):
+        print("Node features shape:", self.node_features.shape)
+        print("Edge index shape:", self.edge_index.shape)
+        print("Edge attributes shape:", self.edge_attr.shape)
+
 
 class MusicGraphPreprocessor:
     """Handles preprocessing of music graph features."""

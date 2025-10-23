@@ -14,8 +14,7 @@ from src.graph import construct_music_graph, NoteGraph
 from src.utils import get_path
 
 
-def visualize_music_graph(notes: List[MusicXMLNote],
-                          graph_data: NoteGraph,
+def visualize_music_graph(graph_data: NoteGraph,
                           figsize: Tuple[int, int] = (15, 10),
                           show_edges: bool = True,
                           edge_alpha: float = 0.3,
@@ -93,13 +92,13 @@ def plot_piano_roll_with_edges(
     # Plot edges if requested
     if show_edges and graph_data.edge_index.shape[1] > 0:
         edge_index = graph_data.edge_index
-        edge_weights = graph_data.edge_attr
+        # edge_weights = graph_data.edge_attr
 
         num_edges = edge_index.shape[1]
         if num_edges > max_edges_to_show:
             indices = np.random.choice(num_edges, max_edges_to_show, replace=False)
             edge_index = edge_index[:, indices]
-            edge_weights = edge_weights[indices]
+            # edge_weights = edge_weights[indices]
 
         segments = []
         colors = []
@@ -113,7 +112,7 @@ def plot_piano_roll_with_edges(
             y2 = node_features[tgt, pitch_idx]
 
             segments.append([(x1, y1), (x2, y2)])
-            colors.append(edge_weights[idx])
+            # colors.append(edge_weights[idx])
 
         # Create line collection
         lc = LineCollection(segments, cmap='viridis', alpha=edge_alpha)
@@ -132,9 +131,8 @@ def plot_piano_roll_with_edges(
     offsets = node_features[:, start_idx] + node_features[:, duration_idx]
 
     # Set reasonable limits
-    ax.set_xlim(-0.5, max(offsets) + 0.5)
-    ax.set_ylim(node_features[:, pitch_idx].min() - 2,
-                node_features[:, pitch_idx].max() + 2)
+    ax.set_xlim(min(offsets) - 0.5, max(offsets) + 0.5)
+    ax.set_ylim(21, 108)
 
 
 def plot_degree_distribution(graph_data: NoteGraph, ax: Axes) -> None:
@@ -281,10 +279,8 @@ def print_validation_stats(graph_data: NoteGraph) -> None:
         for idx in range(min(5, edge_index.shape[1])):
             src, tgt = edge_index[0, idx], edge_index[1, idx]
             time_diff = note_starts[tgt] - note_starts[src]
-            expected_weight = max(1.0 - time_diff / 1, 0.0)
             actual_weight = edge_weights[idx]
-            print(f"  Edge {src}->{tgt}: time_diff={time_diff:.3f}, "
-                  f"weight={actual_weight:.3f} (expected: {expected_weight:.3f})")
+            print(f"  Edge {src}->{tgt}: time_diff={time_diff}, attr={actual_weight}")
 
 
 # Example usage
@@ -296,4 +292,4 @@ if __name__ == "__main__":
     graph = construct_music_graph(test_notes, max_seconds_apart=1)
 
     # Visualize
-    visualize_music_graph(test_notes, graph, show_edges=True, max_edges_to_show=500)
+    visualize_music_graph(graph, show_edges=True, max_edges_to_show=500)

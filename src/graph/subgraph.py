@@ -1,0 +1,220 @@
+from ..extract import MusicXMLNote
+from .make_graph import graph_to_pyg_data
+from .make_graph import NoteGraph
+from .filter import is_good_midi
+from .make_graph import construct_music_graph
+from ..extract import musicxml_to_notes
+from ..utils import get_path
+from ..constants import XML_ROOT
+from ..test import BACH_CHORALE, LE_MOLDEAU, BACH_C_MAJOR_PRELUDE
+import numpy as np
+import random
+from collections import deque, defaultdict
+from math import exp, log
+
+
+def get_edge_weight(graph: NoteGraph, src: int, dst: int) -> float:
+    """Gets the weight associated to each graph edge."""
+    # Inverse of 1 + onset time difference + pitch difference
+    # Make sure src and dst are connected properly
+    start_idx = graph.feature_info.feature_names.index('start')
+    pitch_idx = graph.feature_info.feature_names.index('pitch')
+
+    if graph.node_features[dst, start_idx] < graph.node_features[src, start_idx]:
+        raise ValueError("Destination note occurs before source note")
+
+    time_diff = abs(graph.node_features[dst, start_idx] - graph.node_features[src, start_idx])
+    pitch_diff = abs(graph.node_features[dst, pitch_idx] - graph.node_features[src, pitch_idx])
+    # Think of this as log probability weights
+    # = log(exp(-time_diff/time_weight_beta) * exp(-pitch_diff/pitch_weight_beta))
+    return -time_diff/time_weight_beta - pitch_diff/pitch_weight_beta
+
+
+def sample_from_logprobs(log_probs_dict: dict[int, float]) -> int:
+    # Use log-sum-exp trick to sample from log weights
+    if not log_probs_dict:
+        raise ValueError("log_probs_dict is empty")
+    log_p_max = max(log_probs_dict.values())
+    weights = {k: exp(v - log_p_max) for k, v in log_probs_dict.items()}
+    total_weight = sum(weights.values())
+    threshold = random.random() * total_weight
+    cumulative = 0.0
+    for k, w in weights.items():
+        cumulative += w
+        if cumulative >= threshold:
+            return k
+    return list(log_probs_dict.keys())[-1]
+
+
+def subgraph_from_indices(graph: NoteGraph, selected_nodes: list[int]) -> NoteGraph:
+    selected_nodes_set = set(selected_nodes)
+
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(selected_nodes)}
+
+    sub_node_features = graph.node_features[selected_nodes]
+
+    sub_edges = []
+    sub_edge_attrs = []
+
+    for i in range(graph.edge_index.shape[1]):
+        src, dst = graph.edge_index[0, i], graph.edge_index[1, i]
+        if src in selected_nodes_set and dst in selected_nodes_set:
+            # Add edge with remapped indices
+            sub_edges.append([old_to_new[src], old_to_new[dst]])
+            sub_edge_attrs.append(graph.edge_attr[i])
+
+    if sub_edges:
+        sub_edge_index = np.array(sub_edges, dtype=np.int64).T
+        sub_edge_attr = np.array(sub_edge_attrs, dtype=graph.edge_attr.dtype)
+    else:
+        sub_edge_index = np.zeros((2, 0), dtype=np.int64)
+        sub_edge_attr = np.zeros((0, graph.edge_attr.shape[1]), dtype=graph.edge_attr.dtype)
+
+    return NoteGraph(
+        node_features=sub_node_features,
+        edge_index=sub_edge_index,
+        edge_attr=sub_edge_attr,
+        feature_info=graph.feature_info
+    )
+
+
+def find_path_inner(graph: NoteGraph, adj_list: dict[int, list[int]], current_path: list[int], n: int) -> list[int] | None:
+    """Finds a path of length n starting from start node using DFS."""
+    if len(current_path) == n:
+        return current_path
+    node = current_path[-1]
+    neighbor_pick_weight = {i: get_edge_weight(graph, node, i) for i in adj_list[node] if i not in current_path}
+    tried = {}
+    while neighbor_pick_weight:
+        chosen_neighbor = sample_from_logprobs(neighbor_pick_weight)
+        current_path.append(chosen_neighbor)
+        result = find_path_inner(graph, adj_list, current_path, n)
+        if result is not None:
+            return result
+        current_path.pop()
+        tried[chosen_neighbor] = neighbor_pick_weight[chosen_neighbor]
+        del neighbor_pick_weight[chosen_neighbor]
+    return None
+
+
+def extract_subgraph(graph: NoteGraph, n: int) -> tuple[list[int], NoteGraph]:
+    """
+    Extracts a connected subgraph of size n from the given graph.
+    Returns the list of selected node indices and the corresponding subgraph.
+
+    Args:
+        graph (NoteGraph): The original music graph.
+        n (int): The number of nodes in the desired subgraph.
+    Returns:
+        indices: list[int]: The list of selected node indices.
+        NoteGraph: The extracted subgraph.
+    """
+    if n > graph.num_nodes:
+        raise ValueError(f"Requested subgraph size {n} is larger than total nodes {graph.num_nodes}")
+
+    adj_list: dict[int, list[int]] = {i: [] for i in range(graph.num_nodes)}
+    edge_attr_map: dict[tuple[int, int], int] = {}  # Map (src, dst) to edge attribute index
+    for i in range(graph.edge_index.shape[1]):
+        src, dst = graph.edge_index[0, i].item(), graph.edge_index[1, i].item()
+        adj_list[src].append(dst)
+        edge_attr_map[(src, dst)] = i
+
+    # Attempt to find a connected subgraph of size N
+    attempted_starts = set()
+    for _ in range(graph.num_nodes):
+        available_starts = list(set(range(graph.num_nodes)) - attempted_starts)
+        if not available_starts:
+            break
+        start_node = random.choice(available_starts)
+        attempted_starts.add(start_node)
+        current_path = [start_node]
+        result = find_path_inner(graph, adj_list, current_path, n)
+        if result is not None:
+            return result, subgraph_from_indices(graph, result)
+    raise ValueError(f"Could not find a subgraph of size {n} after trying all possible starting nodes.")
+
+
+def extract_subgraph_naive(graph: NoteGraph, n: int) -> NoteGraph:
+    if n > graph.num_nodes:
+        raise ValueError(f"Requested subgraph size {n} is larger than total nodes {graph.num_nodes}")
+
+    # Build adjacency list
+    adj_list = defaultdict(list)
+    edge_map = {}  # Map (src, dst) to edge index for preserving edge attributes
+
+    for i in range(graph.edge_index.shape[1]):
+        src, dst = graph.edge_index[0, i], graph.edge_index[1, i]
+        adj_list[src].append(dst)
+        edge_map[(src, dst)] = i
+
+    # Check if any connected component has size >= N using BFS
+    visited_global = set()
+    max_component_size = 0
+
+    for start_node in range(graph.num_nodes):
+        if start_node in visited_global:
+            continue
+
+        # BFS to find component size
+        queue = deque([start_node])
+        visited_local = {start_node}
+
+        while queue:
+            node = queue.popleft()
+            for neighbor in adj_list[node]:
+                if neighbor not in visited_local:
+                    visited_local.add(neighbor)
+                    queue.append(neighbor)
+
+        visited_global.update(visited_local)
+        max_component_size = max(max_component_size, len(visited_local))
+
+    if max_component_size < n:
+        raise ValueError(f"No connected component of size >= {n} exists. Largest component has {max_component_size} nodes.")
+
+    # Try to extract subgraph starting from random nodes
+    attempted_starts = set()
+
+    while len(attempted_starts) < graph.num_nodes:
+        available_starts = list(set(range(graph.num_nodes)) - attempted_starts)
+        if not available_starts:
+            break
+
+        start_node = random.choice(available_starts)
+        attempted_starts.add(start_node)
+
+        # BFS to collect N reachable nodes
+        queue = deque([start_node])
+        selected_nodes = {start_node}
+
+        while queue and len(selected_nodes) < n:
+            node = queue.popleft()
+            for neighbor in adj_list[node]:
+                if neighbor not in selected_nodes:
+                    selected_nodes.add(neighbor)
+                    queue.append(neighbor)
+                    if len(selected_nodes) == n:
+                        break
+
+        if len(selected_nodes) >= n:
+            return subgraph_from_indices(graph, list(selected_nodes)[:n])
+
+    raise ValueError(f"Could not find a subgraph of size {n} after trying all possible starting nodes.")
+
+
+if __name__ == "__main__":
+    from scripts.graph.validate import visualize_music_graph
+    path = get_path(XML_ROOT, BACH_C_MAJOR_PRELUDE)
+    notes = musicxml_to_notes(path)
+    is_good_midi(path)
+
+    graph = construct_music_graph(notes, max_seconds_apart=1)
+
+    time_weight_beta = 1
+    pitch_weight_beta = 10
+    indices, subgraph = extract_subgraph(graph, 10)
+    subgraph_notes = [notes[i] for i in indices]
+
+    g = graph_to_pyg_data(subgraph)
+
+    visualize_music_graph(subgraph)
