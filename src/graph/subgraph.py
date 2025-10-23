@@ -13,7 +13,7 @@ from collections import deque, defaultdict
 from math import exp, log
 
 
-def get_edge_weight(graph: NoteGraph, src: int, dst: int) -> float:
+def get_edge_weight(graph: NoteGraph, src: int, dst: int, time_weight_beta: float, pitch_weight_beta: float) -> float:
     """Gets the weight associated to each graph edge."""
     # Inverse of 1 + onset time difference + pitch difference
     # Make sure src and dst are connected properly
@@ -78,17 +78,24 @@ def subgraph_from_indices(graph: NoteGraph, selected_nodes: list[int]) -> NoteGr
     )
 
 
-def find_path_inner(graph: NoteGraph, adj_list: dict[int, list[int]], current_path: list[int], n: int) -> list[int] | None:
+def find_path_inner(
+    graph: NoteGraph,
+    adj_list: dict[int, list[int]],
+    current_path: list[int],
+    n: int,
+    time_weight_beta: float,
+    pitch_weight_beta: float,
+) -> list[int] | None:
     """Finds a path of length n starting from start node using DFS."""
     if len(current_path) == n:
         return current_path
     node = current_path[-1]
-    neighbor_pick_weight = {i: get_edge_weight(graph, node, i) for i in adj_list[node] if i not in current_path}
+    neighbor_pick_weight = {i: get_edge_weight(graph, node, i, time_weight_beta, pitch_weight_beta) for i in adj_list[node] if i not in current_path}
     tried = {}
     while neighbor_pick_weight:
         chosen_neighbor = sample_from_logprobs(neighbor_pick_weight)
         current_path.append(chosen_neighbor)
-        result = find_path_inner(graph, adj_list, current_path, n)
+        result = find_path_inner(graph, adj_list, current_path, n, time_weight_beta, pitch_weight_beta)
         if result is not None:
             return result
         current_path.pop()
@@ -97,7 +104,12 @@ def find_path_inner(graph: NoteGraph, adj_list: dict[int, list[int]], current_pa
     return None
 
 
-def extract_subgraph(graph: NoteGraph, n: int) -> tuple[list[int], NoteGraph]:
+def extract_subgraph(
+    graph: NoteGraph,
+    n: int,
+    time_weight_beta: float = 1,
+    pitch_weight_beta: float = 1,
+) -> NoteGraph:
     """
     Extracts a connected subgraph of size n from the given graph.
     Returns the list of selected node indices and the corresponding subgraph.
@@ -106,7 +118,6 @@ def extract_subgraph(graph: NoteGraph, n: int) -> tuple[list[int], NoteGraph]:
         graph (NoteGraph): The original music graph.
         n (int): The number of nodes in the desired subgraph.
     Returns:
-        indices: list[int]: The list of selected node indices.
         NoteGraph: The extracted subgraph.
     """
     if n > graph.num_nodes:
@@ -128,9 +139,9 @@ def extract_subgraph(graph: NoteGraph, n: int) -> tuple[list[int], NoteGraph]:
         start_node = random.choice(available_starts)
         attempted_starts.add(start_node)
         current_path = [start_node]
-        result = find_path_inner(graph, adj_list, current_path, n)
+        result = find_path_inner(graph, adj_list, current_path, n, time_weight_beta, pitch_weight_beta)
         if result is not None:
-            return result, subgraph_from_indices(graph, result)
+            return subgraph_from_indices(graph, result)
     raise ValueError(f"Could not find a subgraph of size {n} after trying all possible starting nodes.")
 
 
@@ -141,11 +152,7 @@ if __name__ == "__main__":
     is_good_midi(path)
 
     graph = construct_music_graph(notes, max_seconds_apart=1)
-
-    time_weight_beta = 1
-    pitch_weight_beta = 10
-    indices, subgraph = extract_subgraph(graph, 10)
-    subgraph_notes = [notes[i] for i in indices]
+    subgraph = extract_subgraph(graph, 10)
 
     g = graph_to_pyg_data(subgraph)
 
