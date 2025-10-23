@@ -74,6 +74,18 @@ class MusicXMLNote:
         instrument_name = get_gm_instruments_map().get(self.instrument, "Unknown")
         return f"{pitch_class}{self.octave} ({instrument_name}={self.instrument})"
 
+    @staticmethod
+    def pitch_to_index(pitch: int) -> int:
+        """Convert MIDI pitch number to line of fifths index."""
+        assert 0 <= pitch < 128, f"Invalid pitch: {pitch}"
+        return [0, 7, 5, 9, 4, -1, 6, 1, 8, 3, 10, 5][pitch % 12]
+
+    @staticmethod
+    def pitch_to_octave(pitch: int) -> int:
+        """Convert MIDI pitch number to octave number."""
+        assert 0 <= pitch < 128, f"Invalid pitch: {pitch}"
+        return (pitch // 12) - 1
+
 
 def _step_alter_to_lof_index(step: str, alter: int) -> int:
     assert step in {"C", "D", "E", "F", "G", "A", "B"}, f"Invalid step: {step}"

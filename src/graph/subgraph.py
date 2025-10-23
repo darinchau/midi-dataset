@@ -27,7 +27,7 @@ def get_edge_weight(graph: NoteGraph, src: int, dst: int, time_weight_beta: floa
     pitch_diff = abs(graph.node_features[dst, pitch_idx] - graph.node_features[src, pitch_idx])
     # Think of this as log probability weights
     # = log(exp(-time_diff/time_weight_beta) * exp(-pitch_diff/pitch_weight_beta))
-    return -time_diff/time_weight_beta - pitch_diff/pitch_weight_beta
+    return -time_weight_beta * time_diff - pitch_weight_beta * pitch_diff
 
 
 def sample_from_logprobs(log_probs_dict: dict[int, float]) -> int:
@@ -117,6 +117,8 @@ def extract_subgraph(
     Args:
         graph (NoteGraph): The original music graph.
         n (int): The number of nodes in the desired subgraph.
+        time_weight_beta (float): Weighting factor for time difference in edge weights. The higher the beta, the more likely you get note groups with small time differences.
+        pitch_weight_beta (float): Weighting factor for pitch difference in edge weights. The higher the beta, the more likely you get note groups with small pitch differences.
     Returns:
         NoteGraph: The extracted subgraph.
     """
