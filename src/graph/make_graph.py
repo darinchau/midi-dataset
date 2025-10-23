@@ -173,18 +173,3 @@ def graph_to_pyg_data(graph: NoteGraph):
     )
 
     return data
-
-
-def pyg_data_to_graph(data: Data, feature_info: FeatureInfo) -> NoteGraph:
-    """Convert PyTorch Geometric Data object back to NoteGraph format."""
-    # Convert tensors back to numpy arrays
-    node_features = data.x.cpu().numpy() if data.x is not None else np.array([])
-    edge_index = data.edge_index.cpu().numpy() if data.edge_index is not None else np.array([[], []])
-    edge_attr = data.edge_attr.cpu().numpy() if data.edge_attr is not None else np.array([])
-
-    return NoteGraph(
-        node_features=node_features,
-        edge_index=edge_index,
-        edge_attr=edge_attr,
-        feature_info=feature_info
-    )
