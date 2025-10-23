@@ -93,6 +93,41 @@ class MIDIFilterCriterion:
 
         return ""
 
+    def check_graph(self, graph: NoteGraph) -> Optional[str]:
+        """Checks if the graph satisfies the filter criteria. Returns None if good, otherwise a reason."""
+        index_emb = graph.feature_info.feature_names.index("index")
+        instrument_emb = graph.feature_info.feature_names.index("instrument")
+        pitch_emb = graph.feature_info.feature_names.index("pitch")
+        timesig_emb = graph.feature_info.feature_names.index("timesig")
+
+        index_values = set(graph.node_features[:, index_emb].astype(int).tolist())
+        for idx in index_values:
+            if idx not in self.permitted_index():
+                return "InvalidIndex"
+
+        instrument_values = set(graph.node_features[:, instrument_emb].astype(int).tolist())
+        for inst in instrument_values:
+            if inst not in self.permitted_instruments():
+                return "InvalidInstrument"
+
+        pitch_values = set(graph.node_features[:, pitch_emb].astype(int).tolist())
+        for pitch in pitch_values:
+            if pitch not in self.permitted_pitch():
+                return "InvalidPitch"
+
+        timesig_values = set(graph.node_features[:, timesig_emb].astype(int).tolist())
+        permitted_timesig_indices = set(self.permitted_timesigs())
+        for ts in timesig_values:
+            if ts not in permitted_timesig_indices:
+                return "InvalidTimeSignature"
+
+        # Check if start times are non-negative
+        start_idx = graph.feature_info.feature_names.index("start")
+        if np.any(graph.node_features[:, start_idx] < 0):
+            return "NegativeStartTime"
+
+        return None
+
     def normalize(self, graph: NoteGraph) -> NoteGraph:
         """Normalizes the note indices, instruments, and pitches to start from 0."""
         # Create mapping dictionaries for each categorical feature
@@ -124,6 +159,11 @@ class MIDIFilterCriterion:
             [timesig_map[int(v.item())] for v in graph.node_features[:, timesig_emb]],
         )
 
+        # Move the start time to 0
+        start_idx = graph.feature_info.feature_names.index("start")
+        min_start_time = np.min(graph.node_features[:, start_idx])
+        graph.node_features[:, start_idx] -= min_start_time
+
         return graph
 
 
@@ -131,3 +171,9 @@ def is_good_midi(file_path: str | list[MusicXMLNote]) -> bool:
     """Returns True if the MIDI file is considered good based on our filtering criteria.
     Just a convenience wrapper around MIDIFilterCriterion."""
     return not MIDIFilterCriterion().get_bad_midi_reason(file_path)
+
+
+def is_good_notegraph(graph: NoteGraph) -> bool:
+    """Returns True if the NoteGraph is considered good based on our filtering criteria.
+    Just a convenience wrapper around MIDIFilterCriterion."""
+    return MIDIFilterCriterion().check_graph(graph) is None

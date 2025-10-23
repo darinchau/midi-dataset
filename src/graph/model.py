@@ -1,13 +1,16 @@
+import sys
 import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool, GlobalAttention
+from torch_geometric.nn import GATv2Conv, SAGEConv, global_mean_pool, global_max_pool, GlobalAttention
 from torch_geometric.nn import AttentionalAggregation
 from torch_geometric.data import Data, Batch
 import numpy as np
 from torch import Tensor
 from typing import Optional, Tuple, Dict, List
+
+from ..utils import get_model_hierarchy_string, print_model_hierarchy
 
 from ..extract.utils import get_time_signature_map
 from .filter import MIDIFilterCriterion
@@ -45,7 +48,36 @@ class EdgeEncoder(nn.Module):
         return self.edge_mlp(edge_attr)
 
 
-class SymMusicMotifGNN(nn.Module):
+class EdgeAwareAggregation(nn.Module):
+    """Custom aggregation that incorporates edge attributes"""
+
+    def __init__(self, node_dim: int, edge_dim: int, out_dim: int):
+        super().__init__()
+        self.edge_gate = nn.Sequential(
+            nn.Linear(edge_dim, node_dim),
+            nn.Sigmoid()
+        )
+        self.combine = nn.Linear(node_dim * 2, out_dim)
+
+    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Optional[Tensor] = None) -> Tensor:
+        """Apply edge-gated aggregation if edge attributes are provided"""
+        if edge_attr is not None:
+            # Get source nodes
+            src = x[edge_index[0]]
+            # Apply edge gating
+            gates = self.edge_gate(edge_attr)
+            gated_src = src * gates
+            # Aggregate to target nodes
+            out = torch.zeros_like(x)
+            out.index_add_(0, edge_index[1], gated_src)
+            # Combine with original features
+            out = torch.cat([x, out], dim=-1)
+            return self.combine(out)
+        else:
+            return x
+
+
+class SymMusicMotifGAT(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 128,
@@ -166,7 +198,6 @@ class SymMusicMotifGNN(nn.Module):
 
         x = self.feature_transform(x)
 
-        # Encode edges if provided
         if edge_attr is not None:
             edge_emb = self.edge_encoder(edge_attr)
         else:
@@ -183,12 +214,161 @@ class SymMusicMotifGNN(nn.Module):
         x = self.norm2(x)
         x = F.relu(x + identity)  # Skip connection
 
-        # Multiple readout strategies
+        # Readout
         x_att = self.attention_readout(x, batch)
         x_mean = global_mean_pool(x, batch)
         x_max = global_max_pool(x, batch)
+        x = torch.cat([x_att, x_mean, x_max], dim=1)
+        x = self.final_projection(x)
+        return x
 
-        # Combine readouts
+
+class SymMusicMotifGS(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        output_dim: int = 64,
+        num_instruments: int = 16,
+        num_octaves: int = 12,
+        num_pitches: int = 128,
+        num_indices: int = 16,
+        num_timesigs: int = 15,
+        instrument_emb_dim: int = 8,
+        octave_emb_dim: int = 4,
+        pitch_emb_dim: int = 16,
+        index_emb_dim: int = 8,
+        timesig_emb_dim: int = 4,
+        time_emb_dim: int = 64,
+        edge_attr_dim: int = 1,
+        edge_emb_dim: int = 32,
+        dropout: float = 0.2,
+        num_graphsage_layers: int = 8,
+        aggr: str = 'mean',  # GraphSAGE aggregation type: 'mean', 'max', 'lstm'
+    ):
+        super().__init__()
+
+        # Embedding layers for categorical features (same as GAT)
+        self.instrument_embedding = nn.Embedding(num_instruments, instrument_emb_dim)
+        self.octave_embedding = nn.Embedding(num_octaves, octave_emb_dim)
+        self.pitch_embedding = nn.Embedding(num_pitches, pitch_emb_dim)
+        self.index_embedding = nn.Embedding(num_indices, index_emb_dim)
+        self.timesig_embedding = nn.Embedding(num_timesigs, timesig_emb_dim)
+
+        # MLP for continuous features (same as GAT)
+        self.continuous_encoder = nn.Sequential(
+            nn.Linear(4, time_emb_dim * 2),  # 4 continuous features
+            nn.ReLU(),
+            nn.Linear(time_emb_dim * 2, time_emb_dim)
+        )
+
+        # Calculate total embedding dimension
+        self.embedded_feature_dim = (
+            instrument_emb_dim + octave_emb_dim + pitch_emb_dim +
+            index_emb_dim + timesig_emb_dim + time_emb_dim
+        )
+
+        # Initial feature transformation (same as GAT)
+        self.feature_transform = nn.Sequential(
+            nn.Linear(self.embedded_feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # Edge encoder (transforms edge attributes to embeddings)
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_attr_dim, edge_emb_dim),
+            nn.ReLU(),
+            nn.Linear(edge_emb_dim, edge_emb_dim)
+        )
+
+        # GraphSAGE layers
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.edges = nn.ModuleList()
+        for _ in range(num_graphsage_layers):
+            self.convs.append(SAGEConv(
+                hidden_dim,
+                hidden_dim,
+                aggr=aggr,
+                normalize=True,
+                project=True,
+            ))
+            self.norms.append(nn.LayerNorm(hidden_dim))
+            self.edges.append(EdgeAwareAggregation(hidden_dim, edge_emb_dim, hidden_dim))
+
+        # Readout layer (same as GAT)
+        self.attention_readout = AttentionalReadout(hidden_dim)
+
+        # Final projection with non-negative constraint (same as GAT)
+        self.final_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),  # 3x for attention + mean + max
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Softplus()  # Ensures non-negative output for monotonicity
+        )
+
+        if output_dim > hidden_dim * 3:
+            warnings.warn(
+                "Output dimension is greater than hidden_dim * 3; "
+                "this may limit the expressiveness of the final layer."
+            )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        edge_attr: Optional[Tensor] = None,
+        batch: Optional[Tensor] = None
+    ) -> Tensor:
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        # Extract features
+        instrument = x[:, 0].long()
+        pitch = x[:, 1].long()
+        timeinfo = x[:, 2:6].float()
+        index = x[:, 6].long()
+        octave = x[:, 7].long()
+        timesig = x[:, 8].long()
+
+        # Embed categorical features
+        instrument_emb = self.instrument_embedding(instrument)
+        pitch_emb = self.pitch_embedding(pitch)
+        index_emb = self.index_embedding(index)
+        octave_emb = self.octave_embedding(octave)
+        timesig_emb = self.timesig_embedding(timesig)
+        time_emb = self.continuous_encoder(timeinfo)
+
+        x = torch.cat([
+            instrument_emb, pitch_emb, index_emb, octave_emb, timesig_emb, time_emb
+        ], dim=1)
+
+        x = self.feature_transform(x)
+
+        edge_emb = None
+        if edge_attr is not None:
+            edge_emb = self.edge_encoder(edge_attr)
+
+        # GraphSAGE layer with edge-aware aggregation, dropout, and skip connections
+        identity = x
+
+        for conv, norm, edge_agg in zip(self.convs, self.norms, self.edges):
+            if edge_emb is not None:
+                x = edge_agg(x, edge_index, edge_emb)
+            x = conv(x, edge_index)
+            x = norm(x)
+            x = F.relu(x + identity)  # Skip connection
+            x = self.dropout(x)
+            identity = x  # Update identity for next layer
+
+        x_att = self.attention_readout(x, batch)
+        x_mean = global_mean_pool(x, batch)
+        x_max = global_max_pool(x, batch)
         x = torch.cat([x_att, x_mean, x_max], dim=1)
         x = self.final_projection(x)
         return x
@@ -233,7 +413,7 @@ if __name__ == "__main__":
     print("Permitted time signatures:", permitted_timesigs)
 
     # Initialize the model
-    model = SymMusicMotifGNN(
+    model = SymMusicMotifGAT(
         hidden_dim=64,
         output_dim=192,
         num_instruments=len(permitted_instruments),
@@ -249,9 +429,36 @@ if __name__ == "__main__":
         timesig_emb_dim=4,
     )
 
+    print("=" * 80)
+    print("GATv2 Model Summary:")
     print(sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters")
+
+    print(print_model_hierarchy(model))
 
     output = model(data.x, data.edge_index)
 
     print("Output shape:", output.shape)
     print("Output:", output.tolist())
+
+    print("=" * 80)
+    model_gs = SymMusicMotifGS(
+        hidden_dim=64,
+        output_dim=192,
+        num_instruments=len(permitted_instruments),
+        num_octaves=len(permitted_octaves),
+        num_pitches=len(permitted_pitch),
+        num_indices=len(permitted_index),
+        num_timesigs=len(permitted_timesigs),
+        instrument_emb_dim=8,
+        octave_emb_dim=4,
+        pitch_emb_dim=16,
+        index_emb_dim=8,
+        time_emb_dim=64,
+        timesig_emb_dim=4,
+    )
+    print("GraphSAGE Model Summary:")
+    print(sum(p.numel() for p in model_gs.parameters() if p.requires_grad), "trainable parameters")
+    print(print_model_hierarchy(model_gs))
+    output_gs = model_gs(data.x, data.edge_index)
+    print("Output shape:", output_gs.shape)
+    print("Output:", output_gs.tolist())

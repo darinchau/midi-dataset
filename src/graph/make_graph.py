@@ -68,14 +68,18 @@ class NoteGraph:
 def construct_music_graph(
     notes: List[MusicXMLNote],
     remove_barlines: bool = True,
-    max_seconds_apart: float = 10.0,
+    max_seconds_apart: float = 2.0,
+    same_instrument_only: bool = True
 ) -> NoteGraph:
     """
-    Constructs a graph with RAW features. One-hot encoding should be done later.
+    Constructs a graph with RAW features.
     Args:
         notes: List of MusicXMLNote objects.
         remove_barlines: Whether to remove barline notes from the graph.
         max_seconds_apart: Maximum time difference to connect notes with edges.
+        same_instrument_only: Whether to only connect notes from the same instrument.
+    Returns:
+        NoteGraph: The constructed music note graph.
     """
     if not notes:
         return NoteGraph(
@@ -110,17 +114,22 @@ def construct_music_graph(
     node_features = np.array(node_features, dtype=np.float32)
 
     onsets = np.array([note.start for note in notes])
+    instruments = np.array([note.instrument for note in notes])
     num_nodes = len(notes)
 
     # Create edges
     i_indices, j_indices = np.meshgrid(np.arange(num_nodes), np.arange(num_nodes), indexing='ij')
     onset_diffs = onsets[j_indices] - onsets[i_indices]
+    instrument_diffs = instruments[j_indices] - instruments[i_indices]
 
     # Create mask for valid edges:
     # 1. onset_a <= onset_b (onset_diff >= 0)
     # 2. No self-loops (i != j)
     # 3. Within window (onset_diff <= max_seconds_apart)
+    # 4. Same instrument
     valid_mask = (onset_diffs >= 0) & (i_indices != j_indices) & (onset_diffs <= max_seconds_apart)
+    if same_instrument_only:
+        valid_mask &= (instrument_diffs == 0)
 
     edge_sources = i_indices[valid_mask]
     edge_targets = j_indices[valid_mask]
